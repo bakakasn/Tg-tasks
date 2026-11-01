@@ -1,0 +1,5 @@
+python-telegram-bot==21.5
+motor==3.4.0
+telethon==1.36.0
+requests==2.31.0
+pymongo==4.8.0
