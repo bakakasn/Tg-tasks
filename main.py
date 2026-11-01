@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 # ─── ENV ───────────────────────────────────────────────
 BOT_TOKEN       = os.getenv("BOT_TOKEN")
 ADMIN_ID        = int(os.getenv("ADMIN_ID", "6020799349"))
-MONGO_URI       = os.getenv("MONGO_URI", "mongodb://hewopox808_db_user:TRtA39GIhW9i0amT@ac-uvsc6lm-shard-00-00.q1fms7k.mongodb.net:27017,ac-uvsc6lm-shard-00-01.q1fms7k.mongodb.net:27017,ac-uvsc6lm-shard-00-02.q1fms7k.mongodb.net:27017/?ssl=true&replicaSet=atlas-uslskk-shard-0&authSource=admin&appName=Cluster0")
+MONGO_URI       = os.getenv("MONGO_URI", "mongodb+srv://natak20342_db_user:HY5Lr00j1Y0IXuTy@cluster0.pvzgysx.mongodb.net/")
 CHANNEL_ID      = os.getenv("CHANNEL_ID")
 API_ID          = int(os.getenv("API_ID", "39632094"))
 API_HASH        = os.getenv("API_HASH", "858376a6592cc67856f47571f580b0d6")
