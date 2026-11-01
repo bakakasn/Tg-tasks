@@ -60,6 +60,18 @@ def start_http_server():
     Thread(target=server.serve_forever, daemon=True).start()
     logger.info(f"[HTTP] Running on port {port}")
 
+# ─── asyncio loop fix (Python 3.10+) ───────────────────
+def get_or_create_loop():
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_closed():
+            raise RuntimeError
+        return loop
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        return loop
+
 # ─── Cookie loader ─────────────────────────────────────
 def get_cookie_jar():
     jar = http.cookiejar.MozillaCookieJar()
@@ -481,9 +493,8 @@ async def cb_back_main(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ══════════════════════════════════════════════════════
 #  MAIN
 # ══════════════════════════════════════════════════════
-def main():
+async def run_bot():
     os.makedirs("sessions", exist_ok=True)
-    start_http_server()
 
     app = Application.builder().token(BOT_TOKEN).build()
 
@@ -523,7 +534,16 @@ def main():
     ))
 
     logger.info("🤖 Bot starting...")
-    app.run_polling(drop_pending_updates=True)
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(drop_pending_updates=True)
+    # Bot chalata rahega jab tak process band na ho
+    await asyncio.Event().wait()
 
 if __name__ == "__main__":
-    main()
+    start_http_server()
+    loop = get_or_create_loop()
+    try:
+        loop.run_until_complete(run_bot())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped.")
