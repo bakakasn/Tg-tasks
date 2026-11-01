@@ -1,3 +1,4 @@
+
 import os
 import logging
 import asyncio
@@ -33,8 +34,8 @@ API_HASH        = os.getenv("API_HASH", "858376a6592cc67856f47571f580b0d6")
 SITE_URL        = os.getenv("SITE_URL", "https://77uai.com")
 COOKIES_CONTENT = os.getenv("COOKIES_CONTENT", "")
 COOKIE_FILE     = os.getenv("COOKIE_FILE", "cookies.txt")
-TASK_REWARD     = 0.25   # INR per task
-TASK_TIMEOUT    = 540    # 9 min
+TASK_REWARD     = 0.25
+TASK_TIMEOUT    = 540  # 9 min
 
 # ══════════════════════════════════════════════════════
 #  MONGODB
@@ -51,7 +52,7 @@ withdraw_col = _db["withdrawals"]
 ADD_PHONE, ADD_OTP, ADD_2FA, W_AMOUNT, W_UPI = range(5)
 
 # ══════════════════════════════════════════════════════
-#  HTTP SERVER  (Render free tier keep-alive)
+#  HTTP SERVER
 # ══════════════════════════════════════════════════════
 class _PingHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -65,7 +66,7 @@ def start_http():
     logger.info(f"[HTTP] port {port}")
 
 # ══════════════════════════════════════════════════════
-#  ASYNCIO FIX  (Python 3.12+)
+#  ASYNCIO FIX
 # ══════════════════════════════════════════════════════
 def get_loop():
     try:
@@ -128,15 +129,10 @@ async def add_bal(uid, amt):
 #  KEYBOARDS
 # ══════════════════════════════════════════════════════
 def kb_main():
-    # Reply keyboard — hamesha niche dikhega
     return ReplyKeyboardMarkup([
         ["📋 TG Task"],
         ["➕ Add TG Account", "💸 Withdrawal"],
     ], resize_keyboard=True)
-
-def kb_back():
-    # Sirf inline back button jahan zaruri ho
-    return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="back_main")]])
 
 def kb_join():
     return InlineKeyboardMarkup([[
@@ -161,21 +157,18 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     name = update.effective_user.first_name or "User"
     await get_user(uid)
-
     if not await joined(uid, ctx.bot):
         await update.message.reply_text(
             "🔒 *Pehle channel join karo!*",
             parse_mode="Markdown", reply_markup=kb_join()
         )
         return
-
     u = await get_user(uid)
     await update.message.reply_text(
         f"👋 *Namaste {name}!*\n\n"
         f"💰 Balance: ₹{u['balance']:.2f}\n\n"
         f"Niche se option choose karo 👇",
-        parse_mode="Markdown",
-        reply_markup=kb_main()
+        parse_mode="Markdown", reply_markup=kb_main()
     )
 
 async def cb_check_join(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -188,15 +181,12 @@ async def cb_check_join(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"✅ *Join confirm!*\n\n💰 Balance: ₹{u['balance']:.2f}",
             parse_mode="Markdown"
         )
-        await ctx.bot.send_message(uid,
-            "Ab bot use kar sakte ho 👇",
-            reply_markup=kb_main()
-        )
+        await ctx.bot.send_message(uid, "Ab bot use kar sakte ho 👇", reply_markup=kb_main())
     else:
         await q.answer("❌ Abhi join nahi kiya!", show_alert=True)
 
 # ══════════════════════════════════════════════════════
-#  TG TASK  (Reply keyboard se trigger)
+#  TG TASK
 # ══════════════════════════════════════════════════════
 async def msg_tg_task(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -207,7 +197,7 @@ async def msg_tg_task(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     acc = await accounts_col.find_one({"uid": uid, "status": "accepted"})
     if not acc:
         await update.message.reply_text(
-            "⚠️ *Koi accepted account nahi hai.*\n\n"
+            "⚠ *Koi accepted account nahi hai.*\n\n"
             "➕ Add TG Account se pehle account add karo, admin approve karega.",
             parse_mode="Markdown"
         )
@@ -226,8 +216,8 @@ async def msg_tg_task(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # Naya task fetch
     wait_msg = await update.message.reply_text("⏳ Task le rahe hain...")
     account_id = acc.get("site_account_id")
-
     loop = asyncio.get_event_loop()
+
     _, data = await loop.run_in_executor(None, site, "POST", "/api/tasks/claim",
                                           {"channel": "telegram", "account_id": account_id})
     if not data.get("ok"):
@@ -240,12 +230,19 @@ async def msg_tg_task(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Abhi koi task nahi hai. Thodi der baad try karo.")
         return
 
+    # ✅ YAHAN balance note karo — task milne ke waqt
+    _, me_data = await loop.run_in_executor(None, site, "GET", "/api/me")
+    bal_at_claim = me_data.get("data", {}).get("points_balance", 0)
+    logger.info(f"[TASK] uid={uid} bal_at_claim={bal_at_claim}")
+
     expires_at = datetime.now() + timedelta(seconds=TASK_TIMEOUT)
     doc = {
-        "uid": uid, "account_id": account_id,
+        "uid": uid,
+        "account_id": account_id,
         "target_phone": task_data.get("target_phone", ""),
         "ad_copy": task_data.get("ad_copy", ""),
         "status": "pending",
+        "bal_at_claim": bal_at_claim,   # <-- balance store kiya task ke saath
         "created_at": datetime.now(),
         "expires_at": expires_at,
     }
@@ -264,9 +261,8 @@ async def _send_task(msg, task, time_left):
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📝 *Yeh message bhejo:*\n\n"
         f"`{task['ad_copy']}`\n\n"
-        f"👆 Upar wala message copy karo, Telegram mein number pe bhejo, phir Done dabao."
+        f"👆 Copy karo, number pe bhejo, phir Done dabao."
     )
-    # Sirf Done button — Back nahi chahiye task screen pe
     await msg.reply_text(text, parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("✅ Done — Check Karo", callback_data=f"task_done_{task['_id']}")]
@@ -281,36 +277,33 @@ async def cb_task_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     task = await tasks_col.find_one({"_id": ObjectId(tid), "uid": uid})
     if not task:
-        await q.edit_message_text("❌ Task nahi mila.")
-        return
+        await q.edit_message_text("❌ Task nahi mila."); return
     if task["status"] != "pending":
-        await q.edit_message_text(f"ℹ️ Task {task['status']} hai.")
-        return
+        await q.edit_message_text(f"ℹ Task {task['status']} hai."); return
     if datetime.now() > task["expires_at"]:
         await tasks_col.update_one({"_id": task["_id"]}, {"$set": {"status": "expired"}})
-        await q.edit_message_text(
-            "⏰ *Task expire ho gaya!*\n\nNaya task lo.",
-            parse_mode="Markdown"
-        )
+        await q.edit_message_text("⏰ *Task expire ho gaya!*\n\nNaya task lo.", parse_mode="Markdown")
         return
 
     await q.edit_message_text("⏳ Verify ho raha hai... (10 sec)")
 
     loop = asyncio.get_event_loop()
 
-    # Balance pehle
-    _, mb = await loop.run_in_executor(None, site, "GET", "/api/me")
-    bal_before = mb.get("data", {}).get("points_balance", 0)
-
-    # Check call
+    # Check API call
     await loop.run_in_executor(None, site, "POST", "/api/tasks/check", {"channel": "telegram"})
     await asyncio.sleep(10)
 
-    # Balance baad mein
-    _, ma = await loop.run_in_executor(None, site, "GET", "/api/me")
-    bal_after = ma.get("data", {}).get("points_balance", 0)
+    # Balance ab check karo
+    _, me_now = await loop.run_in_executor(None, site, "GET", "/api/me")
+    bal_now = me_now.get("data", {}).get("points_balance", 0)
 
-    if bal_after > bal_before:
+    # Claim ke waqt jo balance tha woh task DB se lo
+    bal_at_claim = task.get("bal_at_claim", 0)
+
+    logger.info(f"[CHECK] uid={uid} bal_at_claim={bal_at_claim} bal_now={bal_now}")
+
+    if bal_now > bal_at_claim:
+        # SUCCESS
         await tasks_col.update_one({"_id": task["_id"]}, {"$set": {"status": "completed"}})
         await add_bal(uid, TASK_REWARD)
         u = await get_user(uid)
@@ -321,6 +314,7 @@ async def cb_task_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
     else:
+        # FAIL — retry button do
         await q.edit_message_text(
             f"❌ *Verify nahi hua*\n\n"
             f"• Message bheja?\n"
@@ -334,7 +328,7 @@ async def cb_task_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
 
 # ══════════════════════════════════════════════════════
-#  ADD ACCOUNT  (Telethon OTP flow)
+#  ADD ACCOUNT (Telethon OTP flow)
 # ══════════════════════════════════════════════════════
 async def msg_add_account(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -342,8 +336,7 @@ async def msg_add_account(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Apna Indian number bhejo:\n"
         "Format: `+91XXXXXXXXXX`\n\n"
         "/cancel to cancel",
-        parse_mode="Markdown",
-        reply_markup=ReplyKeyboardRemove()
+        parse_mode="Markdown", reply_markup=ReplyKeyboardRemove()
     )
     return ADD_PHONE
 
@@ -414,7 +407,6 @@ async def _save_request(uid, phone, me, tg):
         "requested_at": datetime.now(),
     })
     bot = Bot(BOT_TOKEN)
-    # Admin notification — Accept/Reject inline buttons
     await bot.send_message(ADMIN_ID,
         f"🔔 *New Account Request*\n\n"
         f"👤 Name: {name}\n"
@@ -481,7 +473,7 @@ async def admin_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 # ══════════════════════════════════════════════════════
-#  WITHDRAWAL  (Reply keyboard se trigger)
+#  WITHDRAWAL
 # ══════════════════════════════════════════════════════
 async def msg_withdrawal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -490,8 +482,7 @@ async def msg_withdrawal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"💸 *Withdrawal*\n\n"
         f"💰 Available: ₹{u['balance']:.2f}\n\n"
         f"Kitna withdraw karna hai?\n_(Minimum ₹10)_\n\n/cancel to cancel",
-        parse_mode="Markdown",
-        reply_markup=ReplyKeyboardRemove()
+        parse_mode="Markdown", reply_markup=ReplyKeyboardRemove()
     )
     return W_AMOUNT
 
@@ -508,7 +499,7 @@ async def got_w_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Balance kam hai! Available: ₹{u['balance']:.2f}"); return W_AMOUNT
     ctx.user_data["w_amt"] = amt
     await update.message.reply_text(
-        f"📲 Apna UPI ID bhejo:\n_(e.g. name@upi)_\n\n/cancel to cancel",
+        "📲 Apna UPI ID bhejo:\n_(e.g. name@upi)_\n\n/cancel to cancel",
         parse_mode="Markdown"
     )
     return W_UPI
@@ -540,7 +531,6 @@ async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ Cancel.", reply_markup=kb_main())
     return ConversationHandler.END
 
-# ── Back to main (inline back buttons ke liye) ──────────
 async def cb_back_main(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -557,7 +547,6 @@ async def run_bot():
     os.makedirs("sessions", exist_ok=True)
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Add Account conversation
     add_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^➕ Add TG Account$"), msg_add_account)],
         states={
@@ -569,7 +558,6 @@ async def run_bot():
         per_user=True, per_chat=True,
     )
 
-    # Withdrawal conversation
     w_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^💸 Withdrawal$"), msg_withdrawal)],
         states={
@@ -583,18 +571,12 @@ async def run_bot():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(add_conv)
     app.add_handler(w_conv)
-
-    # Reply keyboard triggers
     app.add_handler(MessageHandler(filters.Regex("^📋 TG Task$"), msg_tg_task))
-
-    # Inline callbacks
     app.add_handler(CallbackQueryHandler(cb_check_join,  pattern="^check_join$"))
     app.add_handler(CallbackQueryHandler(cb_back_main,   pattern="^back_main$"))
     app.add_handler(CallbackQueryHandler(cb_task_done,   pattern="^task_done_"))
     app.add_handler(CallbackQueryHandler(cb_acc_accept,  pattern="^acc_accept_"))
     app.add_handler(CallbackQueryHandler(cb_acc_reject,  pattern="^acc_reject_"))
-
-    # Admin text (site ID dene ke liye)
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & filters.User(ADMIN_ID),
         admin_text
