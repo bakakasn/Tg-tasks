@@ -35,8 +35,8 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN    = os.environ["BOT_TOKEN"]
 ADMIN_ID     = int(os.environ["ADMIN_ID"])
 MONGO_URI    = os.environ["MONGO_URI"]
-API_ID       = int(os.environ["API_ID"])
-API_HASH     = os.environ["API_HASH"]
+API_ID       = int(os.environ["API_ID"].strip().strip('"\''))
+API_HASH     = os.environ["API_HASH"].strip().strip('"\'')
 CHANNEL_ID   = os.getenv("CHANNEL_ID", "")      # -100xxxx ya @username
 CHANNEL_LINK = os.getenv("CHANNEL_LINK", "")    # optional: https://t.me/+xxxx
 SITE_URL     = os.getenv("SITE_URL", "https://77uai.com")
@@ -852,6 +852,7 @@ async def run_bot():
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & filters.User(ADMIN_ID), admin_text))
 
+    logger.info(f"[API] id={API_ID} hash={API_HASH[:4]}...{API_HASH[-4:]} len={len(API_HASH)}")
     logger.info("🤖 Bot starting...")
     await app.initialize()
     await app.start()
