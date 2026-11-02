@@ -27,6 +27,8 @@ from telethon.errors import (
 from bson import ObjectId
 
 logging.basicConfig(level=logging.INFO)
+logging.getLogger("httpx").setLevel(logging.WARNING)   # token logs me na aaye
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # ══════════════════════════════════════════════════════
@@ -35,8 +37,8 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN    = os.environ["BOT_TOKEN"]
 ADMIN_ID     = int(os.environ["ADMIN_ID"])
 MONGO_URI    = os.environ["MONGO_URI"]
-API_ID       = int(os.environ["API_ID"].strip().strip('"\''))
-API_HASH     = os.environ["API_HASH"].strip().strip('"\'')
+API_ID       = int(os.getenv("API_ID", "39632094"))
+API_HASH     = os.getenv("API_HASH", "858376a6592cc67856f47571f580b0d6")
 CHANNEL_ID   = os.getenv("CHANNEL_ID", "")      # -100xxxx ya @username
 CHANNEL_LINK = os.getenv("CHANNEL_LINK", "")    # optional: https://t.me/+xxxx
 SITE_URL     = os.getenv("SITE_URL", "https://77uai.com")
