@@ -20,6 +20,7 @@ from telegram.ext import (
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import ReturnDocument
 from telethon import TelegramClient
+from telethon.tl.functions.auth import ResendCodeRequest
 from telethon.errors import (
     SessionPasswordNeededError, PhoneCodeExpiredError, PhoneCodeInvalidError
 )
@@ -475,6 +476,16 @@ async def msg_add_account(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
     return ADD_PHONE
 
+def code_type_text(sent):
+    t = type(sent.type).__name__
+    return {
+        "SentCodeTypeApp": "📲 Telegram app ke andar, 'Telegram' naam ki official chat mein (SMS nahi aayega)",
+        "SentCodeTypeSms": "💬 SMS se",
+        "SentCodeTypeCall": "📞 Phone call se",
+        "SentCodeTypeFlashCall": "📞 Flash call se",
+        "SentCodeTypeMissedCall": "📞 Missed call se",
+    }.get(t, t)
+
 async def got_phone(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     phone = update.message.text.strip()
     uid = update.effective_user.id
@@ -495,7 +506,10 @@ async def got_phone(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data["phone_code_hash"] = res.phone_code_hash
         ctx.user_data["tg_client"] = tg
         await update.message.reply_text(
-            "✅ OTP bheja!\n\nTelegram app mein OTP aaya hoga, woh yahan type karo:\n\n/cancel to cancel")
+            f"✅ OTP bheja gaya: {code_type_text(res)}\n\n"
+            f"Woh code yahan type karo.\n"
+            f"Nahi aaya to `resend` likho.\n\n/cancel to cancel",
+            parse_mode="Markdown")
         return ADD_OTP
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {e}", reply_markup=kb_main())
@@ -504,6 +518,15 @@ async def got_phone(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def got_otp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     tg: TelegramClient = ctx.user_data.get("tg_client")
+    if update.message.text.strip().lower() == "resend":
+        try:
+            res = await tg(ResendCodeRequest(ctx.user_data["phone"], ctx.user_data["phone_code_hash"]))
+            ctx.user_data["phone_code_hash"] = res.phone_code_hash
+            await update.message.reply_text(
+                f"🔁 Dobara bheja: {code_type_text(res)}\n\nCode yahan type karo.")
+        except Exception as e:
+            await update.message.reply_text(f"❌ Resend nahi hua: {e}")
+        return ADD_OTP
     try:
         await tg.sign_in(phone=ctx.user_data["phone"], code=update.message.text.strip(),
                          phone_code_hash=ctx.user_data["phone_code_hash"])
