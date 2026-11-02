@@ -566,8 +566,21 @@ async def cb_acc_reject(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def admin_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return
-    if not ctx.user_data.get("wait_id"): return
     txt = update.message.text.strip()
+
+    # ✏️ Existing account ka Site ID change
+    edit_id = ctx.user_data.get("edit_sid_acc")
+    if edit_id:
+        if not txt.isdigit():
+            await update.message.reply_text("❌ Sirf number bhejo."); return
+        await accounts_col.update_one(
+            {"_id": ObjectId(edit_id)}, {"$set": {"site_account_id": int(txt)}})
+        ctx.user_data.pop("edit_sid_acc", None)
+        await update.message.reply_text(
+            f"✅ Site ID update ho gaya: {txt}\n\n/accounts se aur edit kar sakte ho.")
+        return
+
+    if not ctx.user_data.get("wait_id"): return
     if not txt.isdigit():
         await update.message.reply_text("❌ Sirf number bhejo."); return
     ctx.user_data["p_site_id"] = int(txt)
@@ -604,6 +617,69 @@ async def cb_acc_cookie(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await Bot(BOT_TOKEN).send_message(
         uid, "🎉 *Aapka TG Account Accept Ho Gaya!*\n\nAb TG Task kar sakte ho.",
         parse_mode="Markdown", reply_markup=kb_main())
+
+# ── Admin: accepted accounts ka Site ID / Cookie badlo ──
+async def cmd_accounts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID: return
+    accs = await accounts_col.find({"status": "accepted"}).sort("accepted_at", -1).to_list(60)
+    if not accs:
+        await update.message.reply_text("Koi accepted account nahi hai."); return
+    kb = [[InlineKeyboardButton(
+        f"{a['phone']} | ID {a.get('site_account_id')} | 🍪{a.get('cookie_idx', 0)+1}",
+        callback_data=f"adm_ed_{a['_id']}")] for a in accs]
+    await update.message.reply_text(
+        "📋 *Accepted Accounts*\nEdit karne ke liye account chuno:",
+        parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
+
+async def cb_adm_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.from_user.id != ADMIN_ID:
+        await q.answer("❌ Sirf admin!", show_alert=True); return
+    await q.answer()
+    aid = q.data.replace("adm_ed_", "")
+    a = await accounts_col.find_one({"_id": ObjectId(aid)})
+    if not a:
+        await q.edit_message_text("❌ Account nahi mila."); return
+    await q.edit_message_text(
+        f"📱 {a['phone']} ({a.get('name') or '-'})\n"
+        f"👤 User: {a['uid']}\n"
+        f"🔢 Site ID: {a.get('site_account_id')}\n"
+        f"🍪 Cookie: {a.get('cookie_idx', 0)+1}\n\nKya badalna hai?",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔢 Site ID badlo", callback_data=f"adm_sid_{aid}")],
+            [InlineKeyboardButton("🍪 Cookie badlo", callback_data=f"adm_ckp_{aid}")],
+        ]))
+
+async def cb_adm_sid(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.from_user.id != ADMIN_ID:
+        await q.answer("❌ Sirf admin!", show_alert=True); return
+    await q.answer()
+    ctx.user_data["edit_sid_acc"] = q.data.replace("adm_sid_", "")
+    await q.edit_message_text("🔢 Naya Site Account ID type karo (sirf number):")
+
+async def cb_adm_ckpick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.from_user.id != ADMIN_ID:
+        await q.answer("❌ Sirf admin!", show_alert=True); return
+    await q.answer()
+    aid = q.data.replace("adm_ckp_", "")
+    rows, row = [], []
+    for i in range(len(JARS)):
+        row.append(InlineKeyboardButton(f"🍪 Cookie {i+1}", callback_data=f"adm_cks_{aid}_{i}"))
+        if len(row) == 3:
+            rows.append(row); row = []
+    if row: rows.append(row)
+    await q.edit_message_text("🍪 Naya cookie chuno:", reply_markup=InlineKeyboardMarkup(rows))
+
+async def cb_adm_ckset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.from_user.id != ADMIN_ID:
+        await q.answer("❌ Sirf admin!", show_alert=True); return
+    await q.answer()
+    _, _, aid, idx = q.data.split("_")
+    await accounts_col.update_one({"_id": ObjectId(aid)}, {"$set": {"cookie_idx": int(idx)}})
+    await q.edit_message_text(f"✅ Cookie {int(idx)+1} set ho gaya.\n\n/accounts se aur edit kar sakte ho.")
 
 # ══════════════════════════════════════════════════════
 #  WITHDRAWAL
@@ -718,6 +794,11 @@ async def run_bot():
     app.add_handler(CallbackQueryHandler(cb_acc_accept, pattern="^acc_accept_"))
     app.add_handler(CallbackQueryHandler(cb_acc_reject, pattern="^acc_reject_"))
     app.add_handler(CallbackQueryHandler(cb_acc_cookie, pattern="^acc_ck_"))
+    app.add_handler(CommandHandler("accounts", cmd_accounts))
+    app.add_handler(CallbackQueryHandler(cb_adm_edit,     pattern="^adm_ed_"))
+    app.add_handler(CallbackQueryHandler(cb_adm_sid,      pattern="^adm_sid_"))
+    app.add_handler(CallbackQueryHandler(cb_adm_ckpick,   pattern="^adm_ckp_"))
+    app.add_handler(CallbackQueryHandler(cb_adm_ckset,    pattern="^adm_cks_"))
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & filters.User(ADMIN_ID), admin_text))
 
