@@ -36,7 +36,8 @@ ADMIN_ID     = int(os.environ["ADMIN_ID"])
 MONGO_URI    = os.environ["MONGO_URI"]
 API_ID       = int(os.environ["API_ID"])
 API_HASH     = os.environ["API_HASH"]
-CHANNEL_ID   = os.getenv("CHANNEL_ID", "")
+CHANNEL_ID   = os.getenv("CHANNEL_ID", "")      # -100xxxx ya @username
+CHANNEL_LINK = os.getenv("CHANNEL_LINK", "")    # optional: https://t.me/+xxxx
 SITE_URL     = os.getenv("SITE_URL", "https://77uai.com")
 COOKIE_FILE  = os.getenv("COOKIE_FILE", "cookies.txt")
 
@@ -193,11 +194,37 @@ def kb_main():
         ["➕ Add TG Account", "💸 Withdrawal"],
     ], resize_keyboard=True)
 
-def kb_join():
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("📢 Channel Join Karo", url=f"https://t.me/{CHANNEL_ID.lstrip('@')}"),
-        InlineKeyboardButton("✅ Check Kiya", callback_data="check_join"),
-    ]])
+_link_cache = {"url": None}
+
+async def channel_link(bot):
+    """Join link: CHANNEL_LINK env > @username > bot se invite link"""
+    if CHANNEL_LINK:
+        return CHANNEL_LINK
+    if _link_cache["url"]:
+        return _link_cache["url"]
+    url = None
+    if CHANNEL_ID.startswith("@"):
+        url = f"https://t.me/{CHANNEL_ID[1:]}"
+    else:
+        try:
+            chat = await bot.get_chat(CHANNEL_ID)
+            if chat.username:
+                url = f"https://t.me/{chat.username}"
+            else:
+                url = chat.invite_link or await bot.export_chat_invite_link(CHANNEL_ID)
+        except Exception as e:
+            logger.warning(f"[CHANNEL LINK] {e}")
+    _link_cache["url"] = url
+    return url
+
+async def kb_join(bot):
+    url = await channel_link(bot)
+    btns = []
+    if url:
+        btns.append(InlineKeyboardButton("📢 Channel Join Karo", url=url))
+    btns.append(InlineKeyboardButton("✅ Check Kiya", callback_data="check_join"))
+    return InlineKeyboardMarkup([btns])
+
 
 # ══════════════════════════════════════════════════════
 #  FORCE JOIN
@@ -220,7 +247,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await joined(uid, ctx.bot):
         await update.message.reply_text(
             "🔒 *Pehle channel join karo!*",
-            parse_mode="Markdown", reply_markup=kb_join())
+            parse_mode="Markdown", reply_markup=await kb_join(ctx.bot))
         return
     u = await get_user(uid)
     await update.message.reply_text(
@@ -251,7 +278,7 @@ def acc_label(a):
 async def msg_tg_task(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if not await joined(uid, ctx.bot):
-        await update.message.reply_text("🔒 Pehle channel join karo!", reply_markup=kb_join())
+        await update.message.reply_text("🔒 Pehle channel join karo!", reply_markup=await kb_join(ctx.bot))
         return
 
     accs = await accounts_col.find({"uid": uid, "status": "accepted"}).to_list(50)
