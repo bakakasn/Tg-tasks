@@ -637,9 +637,21 @@ async def start_ws_task(uid, acc, msg):
                 parse_mode="Markdown")
             return
 
-        # Step 2: WA task fetch (current already claimed hota hai)
-        _, task_resp = await loop.run_in_executor(
-            None, site, "GET", "/api/tasks/current?channel=whatsapp", None, idx)
+        # Step 2: Pehle claim try karo, fir current fetch karo
+        _, claim_resp = await loop.run_in_executor(
+            None, site, "POST", "/api/tasks/claim",
+            {"channel": "whatsapp", "account_id": site_account_id}, idx)
+
+        logger.info(f"[WS CLAIM] uid={uid} account_id={site_account_id} resp={claim_resp}")
+
+        if claim_resp.get("ok") and claim_resp.get("data"):
+            task_resp = claim_resp
+        else:
+            # Fallback: current fetch karo
+            _, task_resp = await loop.run_in_executor(
+                None, site, "GET",
+                f"/api/tasks/current?channel=whatsapp&account_id={site_account_id}",
+                None, idx)
 
         await wait_msg.delete()
         task_data = task_resp.get("data")
