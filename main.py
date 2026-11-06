@@ -718,15 +718,16 @@ async def start_ws_task(uid, acc, msg):
         await msg.reply_text("❌ Error aaya, dobara try karo.")
 
 def clean_ad_copy(text):
-    """Remove escape characters and extra whitespace from ad_copy"""
+    """
+    Site se aane wala message EXACTLY preserve karo.
+    Sirf \r\n → \n convert karo (Windows line endings).
+    Extra spaces ya formatting mat hatao — site exact match karta hai.
+    """
     if not text:
         return ""
-    # \r\n → newline, \n → newline, \r → newline
-    text = text.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\r", "\n").replace("\r\n", "\n").replace("\r", "\n")
-    # Multiple blank lines → max 2
-    import re
-    text = re.sub(r'\n{3,}', '\n\n', text)
-    return text.strip()
+    # Windows line endings fix
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    return text
 
 async def _send_ws_task(msg, task, time_left):
     mins, secs = time_left // 60, time_left % 60
@@ -805,37 +806,44 @@ async def cb_ws_task_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     verified = False
     points_earned = 0
 
-    # Method 0: /api/tasks/check ka response directly dekho
-    chk_data = chk_resp.get("data", {})
-    chk_status = chk_data.get("status", "") if isinstance(chk_data, dict) else ""
-    chk_ok = chk_resp.get("ok", False)
-    logger.info(f"[WS CHECK-M0] chk_ok={chk_ok} chk_status={chk_status} chk_data={chk_data}")
-
-    if chk_ok and chk_status == "completed":
+    # Method 0: 404 = "no active task" = task already completed on site
+    if chk_code == 404:
+        logger.info(f"[WS CHECK-M0] 404 = task completed on site")
         verified = True
-        points_earned = chk_data.get("reward_points", 0) or chk_data.get("total_reward_points", 0)
+        points_earned = task.get("reward_min_points", 100)
 
+    # Method 1: matched=True in check response
     if not verified:
-        # Method 1: /api/tasks/current → status check
+        chk_data = chk_resp.get("data", {}) if isinstance(chk_resp.get("data"), dict) else {}
+        chk_matched = chk_data.get("matched", False)
+        inner_task = chk_data.get("task", {}) or {}
+        inner_status = inner_task.get("status", "")
+        logger.info(f"[WS CHECK-M1] matched={chk_matched} status={inner_status}")
+        if chk_matched or inner_status == "completed":
+            verified = True
+            points_earned = inner_task.get("total_reward_points", 0) or inner_task.get("reward_points", 0)
+
+    # Method 2: /api/tasks/current → status
+    if not verified:
         _, task_status = await loop.run_in_executor(
             None, site, "GET",
             f"/api/tasks/current?channel=whatsapp&account_id={site_account_id}", None, idx)
-        current_task = task_status.get("data", {})
-        current_status = current_task.get("status", "")
-        logger.info(f"[WS CHECK-M1] status={current_status} data={current_task}")
+        current_task = task_status.get("data") or {}
+        if isinstance(current_task, dict):
+            current_status = current_task.get("status", "")
+            logger.info(f"[WS CHECK-M2] status={current_status}")
+            if current_status == "completed":
+                verified = True
+                points_earned = current_task.get("total_reward_points", 0) or current_task.get("reward_points", 0)
 
-        if current_status == "completed":
-            verified = True
-            points_earned = current_task.get("reward_points", 0) or current_task.get("total_reward_points", 0)
-
+    # Method 3: reward_points compare
     if not verified:
-        # Method 2: reward_points compare via /api/ws/status
         _, status_data = await loop.run_in_executor(
             None, site, "GET", f"/api/ws/status?account_id={site_account_id}", None, idx)
         binding = status_data.get("data", {}).get("binding", {})
         reward_now = binding.get("reward_points", 0)
         reward_at_claim = task.get("reward_points_at_claim", 0)
-        logger.info(f"[WS CHECK-M2] reward_at_claim={reward_at_claim} reward_now={reward_now}")
+        logger.info(f"[WS CHECK-M3] reward_at_claim={reward_at_claim} reward_now={reward_now}")
         if reward_now > reward_at_claim:
             verified = True
             points_earned = reward_now - reward_at_claim
