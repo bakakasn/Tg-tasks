@@ -875,12 +875,35 @@ async def got_wa_phone(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Valid phone number do (e.g. `+919876543210`)", parse_mode="Markdown")
         return ADD_WA_PHONE
 
-    # Duplicate check
+    # Duplicate check — sirf active/online accounts block karo
     dup = await ws_accounts_col.find_one({"phone": phone, "status": "accepted"})
     if dup:
-        await update.message.reply_text(
-            "⚠ Yeh number pehle se add hai.", reply_markup=kb_main())
-        return ConversationHandler.END
+        # Site pe live status check karo
+        loop = asyncio.get_event_loop()
+        dup_idx = dup.get("cookie_idx", 0)
+        dup_site_id = dup.get("site_account_id")
+        is_active = False
+        try:
+            if dup_site_id and dup_idx < len(JARS):
+                _, st = await loop.run_in_executor(
+                    None, site, "GET",
+                    f"/api/ws/status?account_id={dup_site_id}", None, dup_idx)
+                binding = st.get("data", {}).get("binding", {})
+                is_active = binding.get("authorized", False) and binding.get("phase") in ("online", "sleeping")
+        except Exception:
+            pass
+
+        if is_active:
+            await update.message.reply_text(
+                "⚠ *Yeh number pehle se active hai.*\n\n"
+                "WA Task kar sakte ho — 💬 WA Task button dabao.",
+                parse_mode="Markdown", reply_markup=kb_main())
+            return ConversationHandler.END
+        else:
+            # Disconnected hai — old record remove karo, re-pair karne do
+            await ws_accounts_col.update_one(
+                {"_id": dup["_id"]}, {"$set": {"status": "removed"}})
+            logger.info(f"[WA PAIR] uid={uid} phone={phone} — old disconnected account removed, re-pairing")
 
     wait_msg = await update.message.reply_text("⏳ Pairing code generate ho raha hai...")
 
