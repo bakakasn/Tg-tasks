@@ -44,8 +44,10 @@ CHANNEL_LINK = os.getenv("CHANNEL_LINK", "")
 SITE_URL     = os.getenv("SITE_URL", "https://77uai.com")
 COOKIE_FILE  = os.getenv("COOKIE_FILE", "cookies.txt")
 
-TASK_REWARD  = 0.25
-TASK_TIMEOUT = 540
+TASK_REWARD     = 0.25       # Telegram task reward (INR)
+WS_TASK_REWARD  = 0.25       # WhatsApp task reward (INR) — adjust karein
+TASK_TIMEOUT    = 540        # seconds (9 min)
+WS_TASK_TIMEOUT = 600        # seconds (10 min) — expires_at site se bhi aata hai
 
 IST = ZoneInfo("Asia/Kolkata")
 TASK_START_HOUR = 8
@@ -57,7 +59,9 @@ TASK_END_HOUR   = 22
 _db          = AsyncIOMotorClient(MONGO_URI)["tgbot"]
 users_col    = _db["users"]
 accounts_col = _db["tg_accounts"]
+ws_accounts_col = _db["ws_accounts"]   # WhatsApp accounts
 tasks_col    = _db["tasks"]
+ws_tasks_col = _db["ws_tasks"]         # WhatsApp tasks
 withdraw_col = _db["withdrawals"]
 slots_col    = _db["cookie_slots"]
 
@@ -133,38 +137,82 @@ def site(method, endpoint, body=None, idx=0):
         method, SITE_URL + endpoint,
         cookies=JARS[idx],
         headers={
-            "User-Agent": "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36",
+            "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Mobile Safari/537.36",
             "Accept": "application/json, */*",
             "Content-Type": "application/json",
-            "Referer": SITE_URL, "Origin": SITE_URL,
+            "Referer": SITE_URL + "/tasks/whatsapp",
+            "Origin": SITE_URL,
+            "X-Upliora-Client-Version": "20261104-task-read-retry-v1",
+            "X-Upliora-Telegram": "v2",
+            "Verification": "",
         }, json=body, timeout=15)
     try: return r.status_code, r.json()
     except ValueError: return r.status_code, {"raw": r.text}
 
-# ── Cookie slot lock ────────────────────────────────────
+# ══════════════════════════════════════════════════════
+#  SLOT LOCK SYSTEM
+#  Rules:
+#  - Ek cookie pe ek waqt mein sirf ek TG task  (channel="tg")
+#  - Ek cookie pe ek waqt mein sirf ek WA task  (channel="wa")
+#  - TG + WA simultaneously allowed (alag channels)
+#  - WA pairing chal rahi ho → WA task block (channel="wa_pair")
+#  - TG + WA dono alag alag track hote hain
+#
+#  slots_col document structure:
+#  { idx: 0, channel: "tg",      busy_until: <datetime>, uid: <int> }
+#  { idx: 0, channel: "wa",      busy_until: <datetime>, uid: <int> }
+#  { idx: 0, channel: "wa_pair", busy_until: <datetime>, uid: <int> }
+# ══════════════════════════════════════════════════════
+
 EPOCH = datetime(2000, 1, 1)
+CHANNELS = ["tg", "wa", "wa_pair"]
 
 async def init_slots():
+    """Startup pe sabhi cookie+channel combinations initialize karo"""
     for i in range(len(JARS)):
-        await slots_col.update_one(
-            {"idx": i},
-            {"$setOnInsert": {"idx": i, "busy_until": EPOCH, "uid": None}},
-            upsert=True)
+        for ch in CHANNELS:
+            await slots_col.update_one(
+                {"idx": i, "channel": ch},
+                {"$setOnInsert": {
+                    "idx": i, "channel": ch,
+                    "busy_until": EPOCH, "uid": None
+                }},
+                upsert=True)
 
-async def take_slot(idx, uid):
+async def take_slot(idx, channel, uid, timeout_secs):
+    """
+    Slot lo agar available hai.
+    channel: "tg" | "wa" | "wa_pair"
+    Returns: slot doc if success, None if busy
+    """
     now = datetime.now()
     return await slots_col.find_one_and_update(
-        {"idx": idx, "busy_until": {"$lte": now}},
-        {"$set": {"busy_until": now + timedelta(seconds=TASK_TIMEOUT), "uid": uid}},
+        {"idx": idx, "channel": channel, "busy_until": {"$lte": now}},
+        {"$set": {
+            "busy_until": now + timedelta(seconds=timeout_secs),
+            "uid": uid
+        }},
         return_document=ReturnDocument.AFTER)
 
-async def free_slot(idx):
-    await slots_col.update_one({"idx": idx}, {"$set": {"busy_until": EPOCH, "uid": None}})
+async def free_slot(idx, channel):
+    """Slot free karo jab task complete/expire/fail ho"""
+    await slots_col.update_one(
+        {"idx": idx, "channel": channel},
+        {"$set": {"busy_until": EPOCH, "uid": None}})
 
-async def slot_wait_mins(idx):
-    s = await slots_col.find_one({"idx": idx})
-    if not s: return 1
+async def slot_busy_until(idx, channel):
+    """Kitne time tak busy hai — minutes mein"""
+    s = await slots_col.find_one({"idx": idx, "channel": channel})
+    if not s or s["busy_until"] <= datetime.now():
+        return 0
     return max(1, int((s["busy_until"] - datetime.now()).total_seconds() // 60) + 1)
+
+async def is_slot_free(idx, channel):
+    """Check karo slot free hai ya nahi"""
+    s = await slots_col.find_one({"idx": idx, "channel": channel})
+    if not s:
+        return True
+    return s["busy_until"] <= datetime.now()
 
 def task_window_open():
     return TASK_START_HOUR <= datetime.now(IST).hour < TASK_END_HOUR
@@ -190,8 +238,9 @@ async def add_bal(uid, amt):
 # ══════════════════════════════════════════════════════
 def kb_main():
     return ReplyKeyboardMarkup([
-        ["📋 TG Task"],
-        ["➕ Add TG Account", "💸 Withdrawal"],
+        ["📋 TG Task", "💬 WA Task"],
+        ["➕ Add TG Account", "➕ Add WA Account"],
+        ["💸 Withdrawal"],
     ], resize_keyboard=True)
 
 _link_cache = {"url": None}
@@ -251,6 +300,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"👋 *Namaste {name}!*\n\n"
         f"💰 Balance: ₹{u['balance']:.2f}\n\n"
+        f"📋 TG Task → Telegram number pe message bhejo\n"
+        f"💬 WA Task → WhatsApp number pe message bhejo\n\n"
         f"Niche se option choose karo 👇",
         parse_mode="Markdown", reply_markup=kb_main())
 
@@ -282,7 +333,7 @@ async def msg_tg_task(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     accs = await accounts_col.find({"uid": uid, "status": "accepted"}).to_list(50)
     if not accs:
         await update.message.reply_text(
-            "⚠ *Koi accepted account nahi hai.*\n\n"
+            "⚠ *Koi accepted TG account nahi hai.*\n\n"
             "➕ Add TG Account se pehle account add karo, admin approve karega.",
             parse_mode="Markdown")
         return
@@ -291,10 +342,10 @@ async def msg_tg_task(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if existing:
         left = int((existing["expires_at"] - datetime.now()).total_seconds())
         if left > 0:
-            await _send_task(update.message, existing, left)
+            await _send_tg_task(update.message, existing, left)
             return
         await tasks_col.update_one({"_id": existing["_id"]}, {"$set": {"status": "expired"}})
-        await free_slot(existing.get("cookie_idx", 0))
+        await free_slot(existing.get("cookie_idx", 0), "tg")
 
     if not task_window_open():
         await update.message.reply_text(
@@ -305,12 +356,12 @@ async def msg_tg_task(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if len(accs) == 1:
-        await start_task(uid, accs[0], update.message)
+        await start_tg_task(uid, accs[0], update.message)
         return
 
     kb = [[InlineKeyboardButton(acc_label(a), callback_data=f"pick_acc_{a['_id']}")] for a in accs]
     await update.message.reply_text(
-        "📲 *Kis account se task lena hai?*",
+        "📲 *Kis TG account se task lena hai?*",
         parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
 
 async def cb_pick_acc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -322,28 +373,28 @@ async def cb_pick_acc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not acc:
         await q.edit_message_text("❌ Account nahi mila."); return
     if await tasks_col.find_one({"uid": uid, "status": "pending", "expires_at": {"$gt": datetime.now()}}):
-        await q.edit_message_text("⚠ Aapka ek task already chal raha hai. Pehle usse complete karo.")
+        await q.edit_message_text("⚠ Aapka ek TG task already chal raha hai. Pehle usse complete karo.")
         return
     if not task_window_open():
         await q.edit_message_text("⏰ Task ka time (8 AM - 10 PM) nahi hai."); return
     await q.edit_message_text(f"✅ Selected: {acc_label(acc)}")
-    await start_task(uid, acc, q.message)
+    await start_tg_task(uid, acc, q.message)
 
-async def start_task(uid, acc, msg):
+async def start_tg_task(uid, acc, msg):
     idx = acc.get("cookie_idx", 0)
     if idx >= len(JARS):
         await msg.reply_text("❌ Is account ki cookie configured nahi hai. Admin se contact karo.")
         return
 
-    slot = await take_slot(idx, uid)
+    slot = await take_slot(idx, "tg", uid, TASK_TIMEOUT)
     if not slot:
-        mins = await slot_wait_mins(idx)
+        mins = await slot_busy_until(idx, "tg")
         await msg.reply_text(
-            f"⏳ Is account ka slot abhi busy hai (koi aur task le raha hai).\n"
+            f"⏳ TG task slot abhi busy hai.\n"
             f"Lagbhag *{mins} minute* baad try karo.", parse_mode="Markdown")
         return
 
-    wait_msg = await msg.reply_text("⏳ Task le rahe hain...")
+    wait_msg = await msg.reply_text("⏳ TG Task le rahe hain...")
     account_id = acc.get("site_account_id")
     loop = asyncio.get_event_loop()
     try:
@@ -356,15 +407,15 @@ async def start_task(uid, acc, msg):
         task_data = data.get("data")
         await wait_msg.delete()
         if not task_data:
-            await free_slot(idx)
-            await msg.reply_text("❌ Abhi koi task nahi hai. Thodi der baad try karo.")
+            await free_slot(idx, "tg")
+            await msg.reply_text("❌ Abhi koi TG task nahi hai. Thodi der baad try karo.")
             return
         _, me_data = await loop.run_in_executor(None, site, "GET", "/api/me", None, idx)
         bal_at_claim = me_data.get("data", {}).get("points_balance", 0)
-        logger.info(f"[TASK] uid={uid} cookie={idx} bal_at_claim={bal_at_claim}")
+        logger.info(f"[TG TASK] uid={uid} cookie={idx} bal_at_claim={bal_at_claim}")
     except Exception as e:
-        logger.error(f"[TASK] {e}")
-        await free_slot(idx)
+        logger.error(f"[TG TASK] {e}")
+        await free_slot(idx, "tg")
         await msg.reply_text("❌ Error aaya, dobara try karo.")
         return
 
@@ -379,12 +430,12 @@ async def start_task(uid, acc, msg):
     }
     res = await tasks_col.insert_one(doc)
     doc["_id"] = res.inserted_id
-    await _send_task(msg, doc, TASK_TIMEOUT)
+    await _send_tg_task(msg, doc, TASK_TIMEOUT)
 
-async def _send_task(msg, task, time_left):
+async def _send_tg_task(msg, task, time_left):
     mins, secs = time_left // 60, time_left % 60
     text = (
-        f"📋 *TASK*\n"
+        f"📋 *TELEGRAM TASK*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📤 *Account:* `{task.get('acc_phone', '')}`\n"
         f"📱 *Number:* `+{task['target_phone']}`\n"
@@ -393,7 +444,7 @@ async def _send_task(msg, task, time_left):
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📝 *Yeh message bhejo:*\n\n"
         f"`{task['ad_copy']}`\n\n"
-        f"👆 Copy karo, number pe bhejo, phir Done dabao."
+        f"👆 Copy karo, Telegram number pe bhejo, phir Done dabao."
     )
     await msg.reply_text(
         text, parse_mode="Markdown",
@@ -417,7 +468,7 @@ async def cb_task_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if datetime.now() > task["expires_at"]:
         await tasks_col.update_one({"_id": task["_id"]}, {"$set": {"status": "expired"}})
-        await free_slot(idx)
+        await free_slot(idx, "tg")
         await q.edit_message_text("⏰ *Task expire ho gaya!*\n\nNaya task lo.", parse_mode="Markdown")
         return
 
@@ -430,19 +481,19 @@ async def cb_task_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     _, me_now = await loop.run_in_executor(None, site, "GET", "/api/me", None, idx)
     bal_now = me_now.get("data", {}).get("points_balance", 0)
     bal_at_claim = task.get("bal_at_claim", 0)
-    logger.info(f"[CHECK] uid={uid} cookie={idx} bal_at_claim={bal_at_claim} bal_now={bal_now}")
+    logger.info(f"[TG CHECK] uid={uid} cookie={idx} bal_at_claim={bal_at_claim} bal_now={bal_now}")
 
     if bal_now > bal_at_claim:
         done = await tasks_col.find_one_and_update(
             {"_id": task["_id"], "status": "pending"},
             {"$set": {"status": "completed", "completed_at": datetime.now()}})
-        await free_slot(idx)
+        await free_slot(idx, "tg")
         if not done:
             await q.edit_message_text("ℹ Task already process ho chuka hai."); return
         await add_bal(uid, TASK_REWARD)
         u = await get_user(uid)
         await q.edit_message_text(
-            f"✅ *TASK COMPLETE!*\n\n"
+            f"✅ *TG TASK COMPLETE!*\n\n"
             f"💰 +₹{TASK_REWARD:.2f} mili!\n"
             f"📊 Total Balance: ₹{u['balance']:.2f}",
             parse_mode="Markdown")
@@ -459,11 +510,730 @@ async def cb_task_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ]))
 
 # ══════════════════════════════════════════════════════
-#  ADD ACCOUNT (Telethon OTP flow)
+#  WHATSAPP TASK
+# ══════════════════════════════════════════════════════
+
+def ws_acc_label(a):
+    return f"📱 {a.get('phone', 'WA Account')} | ID {a.get('site_account_id')}"
+
+async def msg_ws_task(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Entry point: user clicks 💬 WA Task"""
+    uid = update.effective_user.id
+    if not await joined(uid, ctx.bot):
+        await update.message.reply_text("🔒 Pehle channel join karo!", reply_markup=await kb_join(ctx.bot))
+        return
+
+    # Check existing pending WA task
+    existing = await ws_tasks_col.find_one({"uid": uid, "status": "pending"})
+    if existing:
+        left = int((existing["expires_at"] - datetime.now()).total_seconds())
+        if left > 0:
+            await _send_ws_task(update.message, existing, left)
+            return
+        await ws_tasks_col.update_one({"_id": existing["_id"]}, {"$set": {"status": "expired"}})
+        await free_slot(existing.get("cookie_idx", 0), "wa")
+
+    if not task_window_open():
+        await update.message.reply_text(
+            f"⏰ *Abhi WA task available nahi hai.*\n\n"
+            f"Task roz *subah 8 baje se raat 10 baje* tak milte hain.\n"
+            f"Agla task {next_open_text()} milega.",
+            parse_mode="Markdown")
+        return
+
+    # Admin-approved WA accounts fetch karo
+    ws_accs = await ws_accounts_col.find({"uid": uid, "status": "accepted"}).to_list(50)
+    if not ws_accs:
+        await update.message.reply_text(
+            "⚠ *Koi WhatsApp account linked nahi hai.*\n\n"
+            "Admin se WhatsApp account add karwao.\n"
+            "Admin ko contact karo aur apna WhatsApp number do.",
+            parse_mode="Markdown")
+        return
+
+    if len(ws_accs) == 1:
+        await start_ws_task(uid, ws_accs[0], update.message)
+        return
+
+    kb = [[InlineKeyboardButton(ws_acc_label(a), callback_data=f"pick_ws_{a['_id']}")] for a in ws_accs]
+    await update.message.reply_text(
+        "📲 *Kis WhatsApp account se task lena hai?*",
+        parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
+
+async def cb_pick_ws(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    acc = await ws_accounts_col.find_one(
+        {"_id": ObjectId(q.data.replace("pick_ws_", "")), "uid": uid, "status": "accepted"})
+    if not acc:
+        await q.edit_message_text("❌ WA Account nahi mila."); return
+    if await ws_tasks_col.find_one({"uid": uid, "status": "pending", "expires_at": {"$gt": datetime.now()}}):
+        await q.edit_message_text("⚠ Ek WA task already chal raha hai. Pehle usse complete karo.")
+        return
+    if not task_window_open():
+        await q.edit_message_text("⏰ Task ka time (8 AM - 10 PM) nahi hai."); return
+    await q.edit_message_text(f"✅ Selected: {ws_acc_label(acc)}")
+    await start_ws_task(uid, acc, q.message)
+
+async def start_ws_task(uid, acc, msg):
+    """
+    WhatsApp task flow:
+    1. /api/ws/status?account_id=... → account online hai ya nahi check
+    2. /api/tasks/current?channel=whatsapp → task fetch (already claimed hota hai)
+    3. Task show karo user ko
+    """
+    idx = acc.get("cookie_idx", 0)
+    site_account_id = acc.get("site_account_id")
+
+    if idx >= len(JARS):
+        await msg.reply_text("❌ Is WA account ki cookie configured nahi hai. Admin se contact karo.")
+        return
+
+    # WA pairing chal rahi hai to block karo
+    if not await is_slot_free(idx, "wa_pair"):
+        mins = await slot_busy_until(idx, "wa_pair")
+        await msg.reply_text(
+            f"⏳ Is cookie pe WA account add ho raha hai.\n"
+            f"Lagbhag *{mins} minute* baad try karo (pairing complete hone do).",
+            parse_mode="Markdown")
+        return
+
+    slot = await take_slot(idx, "wa", uid, WS_TASK_TIMEOUT)
+    if not slot:
+        mins = await slot_busy_until(idx, "wa")
+        await msg.reply_text(
+            f"⏳ WA task slot abhi busy hai.\n"
+            f"Lagbhag *{mins} minute* baad try karo.", parse_mode="Markdown")
+        return
+
+    wait_msg = await msg.reply_text("⏳ WA Task le rahe hain...")
+    loop = asyncio.get_event_loop()
+
+    try:
+        # Step 1: Account online status check
+        _, status_data = await loop.run_in_executor(
+            None, site, "GET", f"/api/ws/status?account_id={site_account_id}", None, idx)
+
+        status_info = status_data.get("data", {}).get("status", {})
+        phase = status_info.get("phase", "")
+        is_authorized = status_data.get("data", {}).get("binding", {}).get("authorized", False)
+
+        if not is_authorized:
+            await wait_msg.delete()
+            await free_slot(idx, "wa")
+            await msg.reply_text(
+                "❌ *WhatsApp account authorized nahi hai.*\n\n"
+                "Account ko site pe reconnect karo ya admin se contact karo.",
+                parse_mode="Markdown")
+            return
+
+        if phase not in ("online", "sleeping"):
+            await wait_msg.delete()
+            await free_slot(idx, "wa")
+            await msg.reply_text(
+                f"⚠ *Account ka phase: `{phase}`*\n\n"
+                "Account abhi ready nahi hai. Thodi der baad try karo.",
+                parse_mode="Markdown")
+            return
+
+        # Step 2: WA task fetch (current already claimed hota hai)
+        _, task_resp = await loop.run_in_executor(
+            None, site, "GET", "/api/tasks/current?channel=whatsapp", None, idx)
+
+        await wait_msg.delete()
+        task_data = task_resp.get("data")
+
+        if not task_data:
+            await free_slot(idx, "wa")
+            await msg.reply_text("❌ Abhi koi WA task nahi hai. Thodi der baad try karo.")
+            return
+
+        # Step 3: Reward points save kar lo verify ke liye
+        binding = status_data.get("data", {}).get("binding", {})
+        reward_points_at_claim = binding.get("reward_points", 0)
+
+        logger.info(f"[WS TASK] uid={uid} cookie={idx} account_id={site_account_id} "
+                    f"reward_points_at_claim={reward_points_at_claim} phase={phase}")
+
+        # Task document save
+        # expires_at site se aata hai — use karein
+        site_expires = task_data.get("expires_at")
+        if site_expires:
+            try:
+                # ISO format: "2026-11-05T12:52:22.491934735Z"
+                expires_at = datetime.fromisoformat(site_expires.replace("Z", "+00:00")).replace(tzinfo=None)
+            except Exception:
+                expires_at = datetime.now() + timedelta(seconds=WS_TASK_TIMEOUT)
+        else:
+            expires_at = datetime.now() + timedelta(seconds=WS_TASK_TIMEOUT)
+
+        doc = {
+            "uid": uid,
+            "site_account_id": site_account_id,
+            "cookie_idx": idx,
+            "ws_phone": acc.get("phone"),
+            "task_id": task_data.get("id"),
+            "target_phone": task_data.get("target_phone", ""),
+            "target_username": task_data.get("target_username", ""),
+            "ad_copy": task_data.get("ad_copy", ""),
+            "reward_min_points": task_data.get("reward_min_points", 100),
+            "reward_max_points": task_data.get("reward_max_points", 150),
+            "reward_points_at_claim": reward_points_at_claim,
+            "status": "pending",
+            "created_at": datetime.now(),
+            "expires_at": expires_at,
+        }
+        res = await ws_tasks_col.insert_one(doc)
+        doc["_id"] = res.inserted_id
+
+        time_left = max(0, int((expires_at - datetime.now()).total_seconds()))
+        await _send_ws_task(msg, doc, time_left)
+
+    except Exception as e:
+        logger.error(f"[WS TASK] {e}")
+        try: await wait_msg.delete()
+        except Exception: pass
+        await free_slot(idx, "wa")
+        await msg.reply_text("❌ Error aaya, dobara try karo.")
+
+async def _send_ws_task(msg, task, time_left):
+    mins, secs = time_left // 60, time_left % 60
+    target = task.get("target_phone", "")
+    username = task.get("target_username", "")
+
+    # WhatsApp direct link
+    wa_link = f"https://wa.me/{target}" if target else ""
+
+    text = (
+        f"💬 *WHATSAPP TASK*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📱 *WA Account:* `{task.get('ws_phone', '')}`\n"
+        f"📲 *Number:* `+{target}`\n"
+    )
+    if username:
+        text += f"👤 *Username:* @{username}\n"
+    text += (
+        f"⏳ *Time:* {mins}m {secs}s\n"
+        f"💰 *Reward:* ₹{WS_TASK_REWARD:.2f}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📝 *Yeh message WhatsApp pe bhejo:*\n\n"
+        f"`{task['ad_copy']}`\n\n"
+        f"👆 Copy karo, is number pe WhatsApp message bhejo, phir Done dabao."
+    )
+
+    buttons = []
+    if wa_link:
+        buttons.append([InlineKeyboardButton("📲 WhatsApp Open Karo", url=wa_link)])
+    buttons.append([InlineKeyboardButton("✅ Done — Check Karo", callback_data=f"ws_done_{task['_id']}")])
+
+    await msg.reply_text(
+        text, parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(buttons))
+
+async def cb_ws_task_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    WA task complete check:
+    /api/ws/status?account_id=... → reward_points compare
+    """
+    q = update.callback_query
+    await q.answer("⏳ Check ho raha hai...")
+    uid = q.from_user.id
+    tid = q.data.replace("ws_done_", "")
+
+    task = await ws_tasks_col.find_one({"_id": ObjectId(tid), "uid": uid})
+    if not task:
+        await q.edit_message_text("❌ Task nahi mila."); return
+    if task["status"] != "pending":
+        await q.edit_message_text(f"ℹ Task {task['status']} hai."); return
+
+    idx = task.get("cookie_idx", 0)
+
+    if datetime.now() > task["expires_at"]:
+        await ws_tasks_col.update_one({"_id": task["_id"]}, {"$set": {"status": "expired"}})
+        await free_slot(idx, "wa")
+        await q.edit_message_text("⏰ *Task expire ho gaya!*\n\nNaya WA task lo.", parse_mode="Markdown")
+        return
+
+    await q.edit_message_text("⏳ WhatsApp verify ho raha hai... (15 sec)")
+    loop = asyncio.get_event_loop()
+    site_account_id = task.get("site_account_id")
+
+    # Site pe check endpoint call
+    await loop.run_in_executor(
+        None, site, "POST", "/api/tasks/check", {"channel": "whatsapp"}, idx)
+    await asyncio.sleep(15)
+
+    # reward_points compare via /api/ws/status
+    _, status_data = await loop.run_in_executor(
+        None, site, "GET", f"/api/ws/status?account_id={site_account_id}", None, idx)
+
+    binding = status_data.get("data", {}).get("binding", {})
+    reward_now = binding.get("reward_points", 0)
+    reward_at_claim = task.get("reward_points_at_claim", 0)
+
+    logger.info(f"[WS CHECK] uid={uid} cookie={idx} account_id={site_account_id} "
+                f"reward_at_claim={reward_at_claim} reward_now={reward_now}")
+
+    if reward_now > reward_at_claim:
+        done = await ws_tasks_col.find_one_and_update(
+            {"_id": task["_id"], "status": "pending"},
+            {"$set": {"status": "completed", "completed_at": datetime.now(),
+                      "reward_points_earned": reward_now - reward_at_claim}})
+        await free_slot(idx, "wa")
+        if not done:
+            await q.edit_message_text("ℹ Task already process ho chuka hai."); return
+        await add_bal(uid, WS_TASK_REWARD)
+        u = await get_user(uid)
+        points_earned = reward_now - reward_at_claim
+        await q.edit_message_text(
+            f"✅ *WA TASK COMPLETE!*\n\n"
+            f"💰 +₹{WS_TASK_REWARD:.2f} mili!\n"
+            f"🎯 Points earned: {points_earned}\n"
+            f"📊 Total Balance: ₹{u['balance']:.2f}",
+            parse_mode="Markdown")
+    else:
+        await q.edit_message_text(
+            "❌ *Verify nahi hua*\n\n"
+            "• WhatsApp pe message bheja?\n"
+            "• Sahi number pe bheja?\n"
+            "• Sahi WhatsApp account se bheja?\n\n"
+            "Message bhejo phir dobara check karo.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 Dobara Check Karo", callback_data=f"ws_done_{tid}")]
+            ]))
+
+# ══════════════════════════════════════════════════════
+#  WA ACCOUNT ADD — USER FLOW (pairing code)
+# ══════════════════════════════════════════════════════
+#
+#  Flow:
+#  1. User: "➕ Add WA Account" button dabata hai
+#  2. Bot: phone number maangta hai
+#  3. Admin cookie se /api/ws/pair POST hoti hai → pairing_code milta hai
+#  4. Bot: user ko code dikhata hai + WA app instructions
+#  5. User: WA app → Linked Devices → Link with phone number → code enter
+#  6. Bot: 3 min polling → phase "online" hone pe DB save + user notify
+
+ADD_WA_PHONE = 10   # conversation state
+
+async def msg_add_wa_account(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """User: ➕ Add WA Account"""
+    uid = update.effective_user.id
+    if not await joined(uid, ctx.bot):
+        await update.message.reply_text("🔒 Pehle channel join karo!", reply_markup=await kb_join(ctx.bot))
+        return ConversationHandler.END
+
+    # Existing pending pairing check
+    pending = await ws_accounts_col.find_one({"uid": uid, "status": "pairing"})
+    if pending:
+        exp = pending.get("pair_expires_at")
+        if exp and datetime.now() < exp:
+            left = int((exp - datetime.now()).total_seconds())
+            code = pending.get("pairing_code", "????")
+            await update.message.reply_text(
+                f"⏳ *Pehle se ek pairing chal rahi hai!*\n\n"
+                f"📱 Number: `{pending.get('phone')}`\n"
+                f"🔑 Code: `{code}`\n"
+                f"⏰ {left} sec baaki\n\n"
+                f"WA app mein enter karo ya /cancel karo.",
+                parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
+            return ConversationHandler.END
+        # Expired — clean up
+        await ws_accounts_col.update_one({"_id": pending["_id"]}, {"$set": {"status": "expired"}})
+
+    await update.message.reply_text(
+        "📱 *WhatsApp Account Add Karo*\n\n"
+        "Apna Indian WhatsApp number bhejo:\n"
+        "Format: `+91XXXXXXXXXX`\n\n"
+        "_(Yeh number site pe linked hoga)_\n\n"
+        "/cancel to cancel",
+        parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
+    return ADD_WA_PHONE
+
+async def got_wa_phone(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """User ne phone number diya — pairing shuru karo"""
+    uid = update.effective_user.id
+    phone = update.message.text.strip()
+
+    # Basic validation
+    clean = phone.replace("+", "").replace(" ", "").replace("-", "")
+    if not clean.isdigit() or len(clean) < 10:
+        await update.message.reply_text("❌ Valid phone number do (e.g. `+919876543210`)", parse_mode="Markdown")
+        return ADD_WA_PHONE
+
+    # Duplicate check
+    dup = await ws_accounts_col.find_one({"phone": phone, "status": "accepted"})
+    if dup:
+        await update.message.reply_text(
+            "⚠ Yeh number pehle se add hai.", reply_markup=kb_main())
+        return ConversationHandler.END
+
+    wait_msg = await update.message.reply_text("⏳ Pairing code generate ho raha hai...")
+
+    pair_idx = int(os.getenv("WA_PAIR_COOKIE_IDX", "0"))
+    if pair_idx >= len(JARS):
+        await wait_msg.delete()
+        await update.message.reply_text(
+            "❌ Pairing cookie configured nahi hai. Admin se contact karo.",
+            reply_markup=kb_main())
+        return ConversationHandler.END
+
+    # WA pairing slot lo — 3 min (180 sec) ke liye
+    # Isse koi WA task nahi le payega is cookie pe jab tak pairing chal rahi hai
+    pair_slot = await take_slot(pair_idx, "wa_pair", uid, 200)
+    if not pair_slot:
+        await wait_msg.delete()
+        mins = await slot_busy_until(pair_idx, "wa_pair")
+        await update.message.reply_text(
+            f"⏳ Abhi kisi aur ka WA account add ho raha hai.\n"
+            f"*{mins} minute* baad try karo.",
+            parse_mode="Markdown", reply_markup=kb_main())
+        return ConversationHandler.END
+
+    loop = asyncio.get_event_loop()
+    try:
+        # POST /api/ws/pair  — phone number body mein
+        _, pair_resp = await loop.run_in_executor(
+            None, site, "POST", "/api/ws/pair",
+            {"phone": clean}, pair_idx)
+
+        logger.info(f"[WA PAIR] uid={uid} phone={phone} resp={pair_resp}")
+
+        pair_data = pair_resp.get("data", {})
+        pairing_code = pair_data.get("pairing_code", "")
+        expires_in   = pair_data.get("expires_in_seconds", 180)
+        attempt_id   = pair_data.get("attempt_id", "")
+        binding      = pair_data.get("binding", {})
+        site_acc_id  = binding.get("id")
+
+        if not pairing_code:
+            await free_slot(pair_idx, "wa_pair")
+            await wait_msg.delete()
+            err_msg = pair_resp.get("message") or pair_resp.get("error") or "Unknown error"
+            await update.message.reply_text(
+                f"❌ Pairing code nahi mila.\n\nError: `{err_msg}`\n\nAdmin se contact karo.",
+                parse_mode="Markdown", reply_markup=kb_main())
+            return ConversationHandler.END
+
+        # DB mein save karo (pairing status)
+        pair_expires_at = datetime.now() + timedelta(seconds=expires_in)
+        doc = {
+            "uid": uid,
+            "phone": phone,
+            "clean_phone": clean,
+            "site_account_id": site_acc_id,
+            "pairing_code": pairing_code,
+            "attempt_id": attempt_id,
+            "pair_expires_at": pair_expires_at,
+            "cookie_idx": pair_idx,
+            "status": "pairing",
+            "created_at": datetime.now(),
+        }
+        result = await ws_accounts_col.insert_one(doc)
+        doc_id = result.inserted_id
+
+        await wait_msg.delete()
+
+        # User ko code dikhao
+        mins = expires_in // 60
+        secs = expires_in % 60
+        await update.message.reply_text(
+            f"✅ *Pairing Code Ready!*\n\n"
+            f"📱 Number: `{phone}`\n"
+            f"🔑 *Code: `{pairing_code}`*\n"
+            f"⏰ Valid: {mins}m {secs}s\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"*WhatsApp pe yeh karo:*\n\n"
+            f"1️⃣ WhatsApp app kholo\n"
+            f"2️⃣ 3 dots (⋮) → Linked Devices\n"
+            f"3️⃣ *Link with Phone Number* dabao\n"
+            f"4️⃣ Upar diya hua code enter karo\n\n"
+            f"⚠ *{mins} minute ke andar enter karo!*",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Code Enter Kar Diya", callback_data=f"wa_pair_check_{doc_id}")
+            ]]))
+
+        # Admin ko notify karo
+        await Bot(BOT_TOKEN).send_message(
+            ADMIN_ID,
+            f"🔔 *New WA Pairing Started*\n\n"
+            f"👤 User: `{uid}`\n"
+            f"📱 Phone: `{phone}`\n"
+            f"🔑 Code: `{pairing_code}`\n"
+            f"🆔 Site ID: `{site_acc_id}`\n"
+            f"⏰ Expires: {mins}m {secs}s",
+            parse_mode="Markdown")
+
+        # Background polling shuru karo
+        asyncio.create_task(
+            _poll_wa_pairing(uid, str(doc_id), site_acc_id, pair_idx, ctx.bot))
+
+    except Exception as e:
+        logger.error(f"[WA PAIR] {e}")
+        await free_slot(pair_idx, "wa_pair")
+        try: await wait_msg.delete()
+        except Exception: pass
+        await update.message.reply_text(
+            f"❌ Error aaya: `{e}`\n\nDobara try karo.", parse_mode="Markdown", reply_markup=kb_main())
+
+    return ConversationHandler.END
+
+async def _poll_wa_pairing(uid, doc_id, site_acc_id, cookie_idx, bot, max_wait=200, interval=10):
+    """
+    Background task: polling karo jab tak WA account online/authorized na ho jaye.
+    max_wait seconds tak try karo.
+    """
+    logger.info(f"[WA POLL] start uid={uid} site_acc_id={site_acc_id}")
+    loop = asyncio.get_event_loop()
+    elapsed = 0
+
+    while elapsed < max_wait:
+        await asyncio.sleep(interval)
+        elapsed += interval
+
+        try:
+            _, status_resp = await loop.run_in_executor(
+                None, site, "GET", f"/api/ws/status?account_id={site_acc_id}", None, cookie_idx)
+
+            binding = status_resp.get("data", {}).get("binding", {})
+            authorized = binding.get("authorized", False)
+            phase = binding.get("phase", "")
+            reward_points = binding.get("reward_points", 0)
+
+            logger.info(f"[WA POLL] uid={uid} elapsed={elapsed} phase={phase} authorized={authorized}")
+
+            if authorized and phase == "online":
+                # ✅ Pairing successful
+                await ws_accounts_col.update_one(
+                    {"_id": ObjectId(doc_id)},
+                    {"$set": {
+                        "status": "accepted",
+                        "authorized": True,
+                        "phase": phase,
+                        "reward_points": reward_points,
+                        "accepted_at": datetime.now(),
+                    }})
+
+                # wa_pair slot free karo — ab WA tasks le sakte hain
+                await free_slot(cookie_idx, "wa_pair")
+
+                await bot.send_message(
+                    uid,
+                    f"🎉 *WhatsApp Account Link Ho Gaya!*\n\n"
+                    f"📱 `{binding.get('requested_phone', '')}`\n"
+                    f"✅ Status: Online\n\n"
+                    f"Ab *💬 WA Task* kar sakte ho!",
+                    parse_mode="Markdown", reply_markup=kb_main())
+
+                await bot.send_message(
+                    ADMIN_ID,
+                    f"✅ *WA Pairing Complete*\n\n"
+                    f"👤 User: `{uid}`\n"
+                    f"📱 `{binding.get('requested_phone', '')}`\n"
+                    f"🆔 Site ID: `{site_acc_id}`\n"
+                    f"🍪 Cookie: `{cookie_idx + 1}`",
+                    parse_mode="Markdown")
+                return
+
+        except Exception as e:
+            logger.error(f"[WA POLL] {e}")
+
+    # Timeout — pairing expire ho gaya
+    logger.info(f"[WA POLL] timeout uid={uid}")
+    # wa_pair slot free karo chahe kuch bhi ho
+    await free_slot(cookie_idx, "wa_pair")
+    existing = await ws_accounts_col.find_one({"_id": ObjectId(doc_id)})
+    if existing and existing.get("status") == "pairing":
+        await ws_accounts_col.update_one(
+            {"_id": ObjectId(doc_id)}, {"$set": {"status": "expired"}})
+        try:
+            await bot.send_message(
+                uid,
+                "⏰ *Pairing expire ho gayi!*\n\n"
+                "Code 3 minute mein enter nahi hua.\n"
+                "Dobara *➕ Add WA Account* dabao.",
+                parse_mode="Markdown", reply_markup=kb_main())
+        except Exception:
+            pass
+
+async def cb_wa_pair_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """User ne 'Code Enter Kar Diya' dabaya — turant status check karo"""
+    q = update.callback_query
+    await q.answer("⏳ Check ho raha hai...")
+    uid = q.from_user.id
+    doc_id = q.data.replace("wa_pair_check_", "")
+
+    doc = await ws_accounts_col.find_one({"_id": ObjectId(doc_id), "uid": uid})
+    if not doc:
+        await q.edit_message_text("❌ Pairing record nahi mila."); return
+
+    if doc["status"] == "accepted":
+        await q.edit_message_text(
+            "✅ *Pehle se link ho chuka hai!*\n\nAb WA Task kar sakte ho.",
+            parse_mode="Markdown"); return
+
+    if doc["status"] == "expired":
+        await q.edit_message_text(
+            "⏰ *Pairing expire ho gayi.*\n\nDobara Add WA Account dabao.",
+            parse_mode="Markdown"); return
+
+    # Manual check
+    site_acc_id = doc.get("site_account_id")
+    cookie_idx  = doc.get("cookie_idx", 0)
+    loop = asyncio.get_event_loop()
+
+    try:
+        _, status_resp = await loop.run_in_executor(
+            None, site, "GET", f"/api/ws/status?account_id={site_acc_id}", None, cookie_idx)
+
+        binding    = status_resp.get("data", {}).get("binding", {})
+        authorized = binding.get("authorized", False)
+        phase      = binding.get("phase", "")
+
+        if authorized and phase == "online":
+            await ws_accounts_col.update_one(
+                {"_id": ObjectId(doc_id)},
+                {"$set": {"status": "accepted", "authorized": True,
+                           "phase": phase, "accepted_at": datetime.now()}})
+            await q.edit_message_text(
+                "🎉 *WhatsApp Account Link Ho Gaya!*\n\n"
+                "Ab 💬 WA Task kar sakte ho!",
+                parse_mode="Markdown")
+            await ctx.bot.send_message(uid, "👇", reply_markup=kb_main())
+        else:
+            left_secs = max(0, int((doc["pair_expires_at"] - datetime.now()).total_seconds()))
+            await q.edit_message_text(
+                f"⏳ *Abhi linked nahi hua.*\n\n"
+                f"Phase: `{phase}` | Authorized: `{authorized}`\n"
+                f"⏰ {left_secs} sec baaki\n\n"
+                f"WA app mein code enter karo phir dobara check karo.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("🔄 Dobara Check Karo", callback_data=f"wa_pair_check_{doc_id}")
+                ]]))
+    except Exception as e:
+        await q.edit_message_text(f"❌ Check failed: `{e}`", parse_mode="Markdown")
+
+# ══════════════════════════════════════════════════════
+#  ADMIN — WA ACCOUNT MANAGEMENT
+# ══════════════════════════════════════════════════════
+
+async def cmd_ws_accounts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        # Regular user: apne WA accounts dekho
+        uid = update.effective_user.id
+        accs = await ws_accounts_col.find({"uid": uid}).sort("created_at", -1).to_list(20)
+        if not accs:
+            await update.message.reply_text(
+                "📱 *Koi WA account nahi hai.*\n\n"
+                "➕ Add WA Account button dabao.",
+                parse_mode="Markdown")
+        else:
+            lines = []
+            for a in accs:
+                emoji = {"accepted": "✅", "pairing": "⏳", "expired": "⏰", "removed": "🗑"}.get(a["status"], "❓")
+                lines.append(f"{emoji} `{a.get('phone')}` — {a['status']}")
+            await update.message.reply_text(
+                "📱 *Aapke WhatsApp Accounts:*\n\n" + "\n".join(lines),
+                parse_mode="Markdown")
+        return
+
+    # Admin: sabke accepted WA accounts
+    accs = await ws_accounts_col.find({"status": "accepted"}).sort("accepted_at", -1).to_list(60)
+    if not accs:
+        await update.message.reply_text("Koi accepted WA account nahi hai."); return
+    kb = [[InlineKeyboardButton(
+        f"{a.get('phone', '?')} | ID {a.get('site_account_id')} | 🍪{a.get('cookie_idx', 0)+1}",
+        callback_data=f"wsadm_ed_{a['_id']}")] for a in accs]
+    await update.message.reply_text(
+        "📋 *WA Accepted Accounts*\nEdit karne ke liye account chuno:",
+        parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
+
+async def cmd_del_ws(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/delws <site_account_id> — Admin: WA account remove"""
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("❌ Sirf admin!"); return
+    parts = update.message.text.split()
+    if len(parts) < 2:
+        await update.message.reply_text("Format: `/delws <site_account_id>`", parse_mode="Markdown"); return
+    try:
+        site_id = int(parts[1])
+    except ValueError:
+        await update.message.reply_text("❌ Valid site account ID do."); return
+    acc = await ws_accounts_col.find_one({"site_account_id": site_id})
+    if not acc:
+        await update.message.reply_text(f"❌ Site ID {site_id} wala WA account nahi mila."); return
+    await ws_accounts_col.update_one({"_id": acc["_id"]}, {"$set": {"status": "removed"}})
+    await update.message.reply_text(
+        f"✅ WA Account remove kar diya:\n`{acc.get('phone')}` (ID: {site_id})",
+        parse_mode="Markdown")
+
+async def cb_wsadm_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.from_user.id != ADMIN_ID:
+        await q.answer("❌ Sirf admin!", show_alert=True); return
+    await q.answer()
+    aid = q.data.replace("wsadm_ed_", "")
+    a = await ws_accounts_col.find_one({"_id": ObjectId(aid)})
+    if not a:
+        await q.edit_message_text("❌ Account nahi mila."); return
+    await q.edit_message_text(
+        f"📱 WA: `{a.get('phone')}`\n"
+        f"👤 User: `{a['uid']}`\n"
+        f"🔢 Site ID: {a.get('site_account_id')}\n"
+        f"🍪 Cookie: {a.get('cookie_idx', 0)+1}\n\nKya badalna hai?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🍪 Cookie badlo", callback_data=f"wsadm_ckp_{aid}")],
+            [InlineKeyboardButton("❌ Remove Account", callback_data=f"wsadm_del_{aid}")],
+        ]))
+
+async def cb_wsadm_ckpick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.from_user.id != ADMIN_ID:
+        await q.answer("❌ Sirf admin!", show_alert=True); return
+    await q.answer()
+    aid = q.data.replace("wsadm_ckp_", "")
+    rows, row = [], []
+    for i in range(len(JARS)):
+        row.append(InlineKeyboardButton(f"🍪 Cookie {i+1}", callback_data=f"wsadm_cks_{aid}_{i}"))
+        if len(row) == 3:
+            rows.append(row); row = []
+    if row: rows.append(row)
+    await q.edit_message_text("🍪 Naya cookie chuno:", reply_markup=InlineKeyboardMarkup(rows))
+
+async def cb_wsadm_ckset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.from_user.id != ADMIN_ID:
+        await q.answer("❌ Sirf admin!", show_alert=True); return
+    await q.answer()
+    parts = q.data.split("_")   # wsadm_cks_<aid>_<idx>
+    aid = parts[2]
+    idx = int(parts[3])
+    await ws_accounts_col.update_one({"_id": ObjectId(aid)}, {"$set": {"cookie_idx": idx}})
+    await q.edit_message_text(f"✅ WA Account cookie {idx+1} set ho gaya.")
+
+async def cb_wsadm_del(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.from_user.id != ADMIN_ID:
+        await q.answer("❌ Sirf admin!", show_alert=True); return
+    await q.answer()
+    aid = q.data.replace("wsadm_del_", "")
+    acc = await ws_accounts_col.find_one({"_id": ObjectId(aid)})
+    if not acc:
+        await q.edit_message_text("❌ Account nahi mila."); return
+    await ws_accounts_col.update_one({"_id": ObjectId(aid)}, {"$set": {"status": "removed"}})
+    await q.edit_message_text(f"✅ WA Account `{acc.get('phone')}` remove kar diya.", parse_mode="Markdown")
+
+# ══════════════════════════════════════════════════════
+#  ADD TG ACCOUNT (Telethon OTP flow)
 # ══════════════════════════════════════════════════════
 async def msg_add_account(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "📱 *Account Add Karo*\n\n"
+        "📱 *TG Account Add Karo*\n\n"
         "Apna Indian number bhejo:\n"
         "Format: `+91XXXXXXXXXX`\n\n"
         "/cancel to cancel",
@@ -568,7 +1338,7 @@ async def _save_request(uid, phone, me, tg):
     })
     await Bot(BOT_TOKEN).send_message(
         ADMIN_ID,
-        f"🔔 *New Account Request*\n\n"
+        f"🔔 *New TG Account Request*\n\n"
         f"👤 Name: {name}\n"
         f"📱 Phone: `{phone}`\n"
         f"🆔 TG ID: `{me.id}`\n"
@@ -578,26 +1348,21 @@ async def _save_request(uid, phone, me, tg):
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("✅ Accept", callback_data=f"acc_accept_{uid}_{me.id}"),
             InlineKeyboardButton("❌ Reject", callback_data=f"acc_reject_{uid}_{me.id}"),
-            # ══ NEW: Fetch OTP button ══
             InlineKeyboardButton("📨 Fetch OTP", callback_data=f"fetch_otp_{uid}_{me.id}"),
         ]]))
     await tg.disconnect()
 
 # ══════════════════════════════════════════════════════
-#  FETCH OTP — admin ke liye latest OTP fetch karo
+#  FETCH OTP
 # ══════════════════════════════════════════════════════
 async def cb_fetch_otp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """
-    Admin 'Fetch OTP' dabata hai → us account ki Telethon session reconnect karke
-    'Telegram' (777000) se latest message (OTP) fetch karta hai.
-    """
     q = update.callback_query
     if q.from_user.id != ADMIN_ID:
         await q.answer("❌ Sirf admin!", show_alert=True)
         return
     await q.answer("⏳ OTP fetch ho raha hai...")
 
-    parts = q.data.split("_")   # fetch_otp_<uid>_<tg_id>
+    parts = q.data.split("_")
     uid   = int(parts[2])
     tg_id = int(parts[3])
 
@@ -613,18 +1378,14 @@ async def cb_fetch_otp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     tg = TelegramClient(session_path, API_ID, API_HASH)
     try:
         await tg.connect()
-
         if not await tg.is_user_authorized():
             await ctx.bot.send_message(
                 ADMIN_ID,
-                f"⚠ `{phone}` ka session authorized nahi hai.\n"
-                f"User ko dobara login karwao.",
+                f"⚠ `{phone}` ka session authorized nahi hai.\nUser ko dobara login karwao.",
                 parse_mode="Markdown")
             return
 
-        # Telegram ka official account: 777000
         messages = await tg.get_messages(777000, limit=5)
-
         if not messages:
             await ctx.bot.send_message(
                 ADMIN_ID,
@@ -632,30 +1393,23 @@ async def cb_fetch_otp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown")
             return
 
-        # Sabse latest message dikhao
         latest = messages[0]
         msg_time = latest.date.strftime("%d/%m/%Y %H:%M:%S UTC") if latest.date else "N/A"
-
         await ctx.bot.send_message(
             ADMIN_ID,
             f"📨 *Latest OTP — `{phone}`*\n\n"
             f"🕐 *Time:* `{msg_time}`\n\n"
             f"📝 *Message:*\n{latest.text or '(empty)'}",
             parse_mode="Markdown")
-
     except Exception as e:
         logger.error(f"[FETCH OTP] {e}")
         await ctx.bot.send_message(
-            ADMIN_ID,
-            f"❌ OTP fetch nahi hua `{phone}`:\n`{e}`",
-            parse_mode="Markdown")
+            ADMIN_ID, f"❌ OTP fetch nahi hua `{phone}`:\n`{e}`", parse_mode="Markdown")
     finally:
-        try:
-            await tg.disconnect()
-        except Exception:
-            pass
+        try: await tg.disconnect()
+        except Exception: pass
 
-# ── Admin Accept / Reject ───────────────────────────────
+# ── Admin Accept / Reject TG ─────────────────────────
 async def cb_acc_accept(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if q.from_user.id != ADMIN_ID:
@@ -679,7 +1433,7 @@ async def cb_acc_reject(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await accounts_col.update_one({"uid": uid, "tg_id": tg_id}, {"$set": {"status": "rejected"}})
     await q.edit_message_text(q.message.text + "\n\n❌ REJECTED")
     await Bot(BOT_TOKEN).send_message(
-        uid, "❌ Aapka account reject ho gaya.\nDobara try karo ya admin se contact karo.",
+        uid, "❌ Aapka TG account reject ho gaya.\nDobara try karo ya admin se contact karo.",
         reply_markup=kb_main())
 
 async def admin_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -710,7 +1464,7 @@ async def admin_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             rows.append(row); row = []
     if row: rows.append(row)
     await update.message.reply_text(
-        "🍪 Ye account site pe kis cookie wale login me hai?",
+        "🍪 Ye TG account site pe kis cookie wale login me hai?",
         reply_markup=InlineKeyboardMarkup(rows))
 
 async def cb_acc_cookie(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -730,22 +1484,22 @@ async def cb_acc_cookie(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         {"$set": {"status": "accepted", "site_account_id": site_id,
                   "cookie_idx": idx, "accepted_at": datetime.now()}})
     ctx.user_data.pop("p_site_id", None)
-    await q.edit_message_text(f"✅ Accepted!\nSite ID: {site_id}\n🍪 Cookie: {idx+1}")
+    await q.edit_message_text(f"✅ TG Account Accepted!\nSite ID: {site_id}\n🍪 Cookie: {idx+1}")
     await Bot(BOT_TOKEN).send_message(
         uid, "🎉 *Aapka TG Account Accept Ho Gaya!*\n\nAb TG Task kar sakte ho.",
         parse_mode="Markdown", reply_markup=kb_main())
 
-# ── Admin: accounts list / edit ─────────────────────────
+# ── Admin: TG accounts list / edit ──────────────────────
 async def cmd_accounts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return
     accs = await accounts_col.find({"status": "accepted"}).sort("accepted_at", -1).to_list(60)
     if not accs:
-        await update.message.reply_text("Koi accepted account nahi hai."); return
+        await update.message.reply_text("Koi accepted TG account nahi hai."); return
     kb = [[InlineKeyboardButton(
         f"{a['phone']} | ID {a.get('site_account_id')} | 🍪{a.get('cookie_idx', 0)+1}",
         callback_data=f"adm_ed_{a['_id']}")] for a in accs]
     await update.message.reply_text(
-        "📋 *Accepted Accounts*\nEdit karne ke liye account chuno:",
+        "📋 *Accepted TG Accounts*\nEdit karne ke liye account chuno:",
         parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
 
 async def cb_adm_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -889,6 +1643,15 @@ async def run_bot():
         per_user=True, per_chat=True,
     )
 
+    add_wa_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex("^➕ Add WA Account$"), msg_add_wa_account)],
+        states={
+            ADD_WA_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_wa_phone)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+        per_user=True, per_chat=True,
+    )
+
     w_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex("^💸 Withdrawal$"), msg_withdrawal)],
         states={
@@ -899,19 +1662,41 @@ async def run_bot():
         per_user=True, per_chat=True,
     )
 
+    # ── Core handlers ──────────────────────────────────
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(add_conv)
+    app.add_handler(add_wa_conv)
     app.add_handler(w_conv)
+
+    # TG Task
     app.add_handler(MessageHandler(filters.Regex("^📋 TG Task$"), msg_tg_task))
+    app.add_handler(CallbackQueryHandler(cb_pick_acc,    pattern="^pick_acc_"))
+    app.add_handler(CallbackQueryHandler(cb_task_done,   pattern="^task_done_"))
+
+    # WA Task
+    app.add_handler(MessageHandler(filters.Regex("^💬 WA Task$"), msg_ws_task))
+    app.add_handler(CallbackQueryHandler(cb_pick_ws,     pattern="^pick_ws_"))
+    app.add_handler(CallbackQueryHandler(cb_ws_task_done, pattern="^ws_done_"))
+
+    # WA Pairing
+    app.add_handler(CallbackQueryHandler(cb_wa_pair_check, pattern="^wa_pair_check_"))
+
+    # WA Admin
+    app.add_handler(CommandHandler("wsaccounts", cmd_ws_accounts))
+    app.add_handler(CommandHandler("addws", cmd_add_ws))
+    app.add_handler(CommandHandler("delws", cmd_del_ws))
+    app.add_handler(CallbackQueryHandler(cb_wsadm_edit,   pattern="^wsadm_ed_"))
+    app.add_handler(CallbackQueryHandler(cb_wsadm_ckpick, pattern="^wsadm_ckp_"))
+    app.add_handler(CallbackQueryHandler(cb_wsadm_ckset,  pattern="^wsadm_cks_"))
+    app.add_handler(CallbackQueryHandler(cb_wsadm_del,    pattern="^wsadm_del_"))
+
+    # TG Account management
     app.add_handler(CallbackQueryHandler(cb_check_join,  pattern="^check_join$"))
     app.add_handler(CallbackQueryHandler(cb_back_main,   pattern="^back_main$"))
-    app.add_handler(CallbackQueryHandler(cb_task_done,   pattern="^task_done_"))
-    app.add_handler(CallbackQueryHandler(cb_pick_acc,    pattern="^pick_acc_"))
     app.add_handler(CallbackQueryHandler(cb_acc_accept,  pattern="^acc_accept_"))
     app.add_handler(CallbackQueryHandler(cb_acc_reject,  pattern="^acc_reject_"))
-    app.add_handler(CallbackQueryHandler(cb_acc_cookie,  pattern="^acc_ck_"))
-    # ══ NEW handler ══
     app.add_handler(CallbackQueryHandler(cb_fetch_otp,   pattern="^fetch_otp_"))
+    app.add_handler(CallbackQueryHandler(cb_acc_cookie,  pattern="^acc_ck_"))
     app.add_handler(CommandHandler("accounts", cmd_accounts))
     app.add_handler(CallbackQueryHandler(cb_adm_edit,    pattern="^adm_ed_"))
     app.add_handler(CallbackQueryHandler(cb_adm_sid,     pattern="^adm_sid_"))
@@ -921,7 +1706,7 @@ async def run_bot():
         filters.TEXT & ~filters.COMMAND & filters.User(ADMIN_ID), admin_text))
 
     logger.info(f"[API] id={API_ID} hash={API_HASH[:4]}...{API_HASH[-4:]} len={len(API_HASH)}")
-    logger.info("🤖 Bot starting...")
+    logger.info("🤖 Bot starting (TG + WA tasks)...")
     await app.initialize()
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
