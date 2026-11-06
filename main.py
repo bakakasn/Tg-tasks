@@ -742,8 +742,8 @@ async def _send_ws_task(msg, task, time_left):
 
     # wa.me link mein message pre-fill karo — click pe WA khulega with message ready
     import urllib.parse
-    # wa.me link mein EXACT original message — site isi se match karta hai
-    original_copy = raw_ad_copy(task.get("ad_copy", ""))
+    # wa.me link — \r\n ko \n karo (WA %0A expect karta hai, %0D%0A nahi)
+    original_copy = task.get("ad_copy", "").replace("\r\n", "\n").replace("\r", "\n")
     wa_link = f"https://wa.me/{target}?text={urllib.parse.quote(original_copy)}" if target else ""
 
     text = (
@@ -804,13 +804,18 @@ async def cb_ws_task_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     site_account_id = task.get("site_account_id")
     task_site_id = task.get("task_id")
 
-    # Site pe check call
+    # Site pe check call — task_id aur message bhi bhejo
+    check_body = {
+        "channel": "whatsapp",
+        "account_id": site_account_id,
+        "task_id": task_site_id,
+    }
     chk_code, chk_resp = await loop.run_in_executor(
-        None, site, "POST", "/api/tasks/check",
-        {"channel": "whatsapp", "account_id": site_account_id}, idx)
+        None, site, "POST", "/api/tasks/check", check_body, idx)
     logger.info(f"[WS CHECK-CALL] uid={uid} http={chk_code} resp={chk_resp}")
 
-    await asyncio.sleep(5)
+    # Site ko time do WA message process karne ke liye
+    await asyncio.sleep(10)
 
     verified = False
     points_earned = 0
