@@ -52,6 +52,8 @@ COOKIE_FILE  = os.getenv("COOKIE_FILE", "cookies.txt")
 
 TASK_REWARD     = 0.25       # Telegram task reward (INR)
 WS_TASK_REWARD  = 0.25       # WhatsApp task reward (INR) — adjust karein
+MIN_WITHDRAW    = 5          # minimum withdrawal (INR)
+WITHDRAW_TAX    = 2          # har withdrawal pe tax (INR)
 TASK_TIMEOUT    = 540        # seconds (9 min)
 WS_TASK_TIMEOUT = 600        # seconds (10 min) — expires_at site se bhi aata hai
 
@@ -1607,7 +1609,9 @@ async def msg_withdrawal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"💸 *Withdrawal*\n\n"
         f"💰 Available: ₹{u['balance']:.2f}\n\n"
-        f"Kitna withdraw karna hai?\n_(Minimum ₹10)_\n\n/cancel to cancel",
+        f"Kitna withdraw karna hai?\n"
+        f"_(Minimum ₹{MIN_WITHDRAW} | Har withdrawal pe ₹{WITHDRAW_TAX} tax kategi)_\n\n"
+        f"/cancel to cancel",
         parse_mode="Markdown", reply_markup=ReplyKeyboardRemove())
     return W_AMOUNT
 
@@ -1618,14 +1622,17 @@ async def got_w_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         amt = float(update.message.text.strip())
     except ValueError:
         await update.message.reply_text("❌ Valid amount likho."); return W_AMOUNT
-    if amt < 10:
-        await update.message.reply_text("❌ Minimum ₹10!"); return W_AMOUNT
+    if amt < MIN_WITHDRAW:
+        await update.message.reply_text(f"❌ Minimum ₹{MIN_WITHDRAW}!"); return W_AMOUNT
     if amt > u["balance"]:
         await update.message.reply_text(f"❌ Balance kam hai! Available: ₹{u['balance']:.2f}"); return W_AMOUNT
     ctx.user_data["w_amt"] = amt
+    payout = amt - WITHDRAW_TAX
     await update.message.reply_text(
-        "📲 Apna UPI ID bhejo:\n_(e.g. name@upi)_\n\n/cancel to cancel",
-        parse_mode="Markdown")
+        f"💰 Withdraw: ₹{amt:.2f}\n"
+        f"🧾 Tax: ₹{WITHDRAW_TAX:.2f}\n"
+        f"✅ Aapko milega: ₹{payout:.2f}\n\n"
+        f"📲 Ab apna UPI ID bhejo:\n(e.g. name@upi)\n\n/cancel to cancel")
     return W_UPI
 
 async def got_w_upi(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1639,20 +1646,27 @@ async def got_w_upi(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Balance kam hai!", reply_markup=kb_main())
         return ConversationHandler.END
 
+    payout = amt - WITHDRAW_TAX
     await withdraw_col.insert_one({
-        "uid": uid, "amount": amt, "upi": upi,
-        "status": "pending", "requested_at": datetime.now()
+        "uid": uid, "amount": amt, "tax": WITHDRAW_TAX, "payout": payout,
+        "upi": upi, "status": "pending", "requested_at": datetime.now()
     })
     await update.message.reply_text(
         f"✅ *Withdrawal Request Bheja!*\n\n"
         f"💰 Amount: ₹{amt:.2f}\n"
+        f"🧾 Tax: ₹{WITHDRAW_TAX:.2f}\n"
+        f"✅ Aapko milega: ₹{payout:.2f}\n"
         f"📲 UPI: {upi}\n\n"
         f"24-48 hours mein process hogi.",
         parse_mode="Markdown", reply_markup=kb_main())
     await Bot(BOT_TOKEN).send_message(
         ADMIN_ID,
         f"💸 *Withdrawal Request*\n\n"
-        f"👤 User: `{uid}`\n💰 ₹{amt:.2f}\n📲 `{upi}`",
+        f"👤 User: `{uid}`\n"
+        f"💰 Amount: ₹{amt:.2f}\n"
+        f"🧾 Tax: ₹{WITHDRAW_TAX:.2f}\n"
+        f"✅ *Pay karna hai: ₹{payout:.2f}*\n"
+        f"📲 `{upi}`",
         parse_mode="Markdown")
     return ConversationHandler.END
 
