@@ -453,6 +453,9 @@ async def _send_tg_task(msg, task, time_left):
             [InlineKeyboardButton("✅ Done — Check Karo", callback_data=f"task_done_{task['_id']}")]
         ]))
 
+    # Ad copy alag message mein — ek click copy ke liye
+    await msg.reply_text(ad_copy)
+
 async def cb_task_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer("⏳ Check ho raha hai...")
@@ -473,11 +476,13 @@ async def cb_task_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("⏰ *Task expire ho gaya!*\n\nNaya task lo.", parse_mode="Markdown")
         return
 
-    await q.edit_message_text("⏳ Verify ho raha hai... (20 sec)")
+    await q.edit_message_text("⏳ Checking... (5 sec)")
     loop = asyncio.get_event_loop()
 
-    await loop.run_in_executor(None, site, "POST", "/api/tasks/check", {"channel": "telegram"}, idx)
-    await asyncio.sleep(20)
+    chk_code, chk_resp = await loop.run_in_executor(
+        None, site, "POST", "/api/tasks/check", {"channel": "telegram"}, idx)
+    logger.info(f"[TG CHECK-CALL] uid={uid} http={chk_code} resp={chk_resp}")
+    await asyncio.sleep(5)
 
     _, me_now = await loop.run_in_executor(None, site, "GET", "/api/me", None, idx)
     bal_now = me_now.get("data", {}).get("points_balance", 0)
@@ -485,9 +490,11 @@ async def cb_task_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     logger.info(f"[TG CHECK] uid={uid} cookie={idx} bal_at_claim={bal_at_claim} bal_now={bal_now}")
 
     if bal_now > bal_at_claim:
+        new_expires = datetime.now() + timedelta(seconds=TASK_TIMEOUT)
         done = await tasks_col.find_one_and_update(
             {"_id": task["_id"], "status": "pending"},
-            {"$set": {"status": "completed", "completed_at": datetime.now()}})
+            {"$set": {"status": "completed", "completed_at": datetime.now(),
+                      "expires_at": new_expires}})
         await free_slot(idx, "tg")
         if not done:
             await q.edit_message_text("ℹ Task already process ho chuka hai."); return
@@ -755,6 +762,9 @@ async def _send_ws_task(msg, task, time_left):
         text, parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(buttons))
 
+    # Ad copy alag message mein bhejo — ek click copy ke liye
+    await msg.reply_text(ad_copy)
+
 async def cb_ws_task_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """
     WA task complete check:
@@ -779,47 +789,52 @@ async def cb_ws_task_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("⏰ *Task expire ho gaya!*\n\nNaya WA task lo.", parse_mode="Markdown")
         return
 
-    await q.edit_message_text("⏳ WhatsApp verify ho raha hai... (20 sec)")
+    await q.edit_message_text("⏳ Checking... (5 sec)")
     loop = asyncio.get_event_loop()
     site_account_id = task.get("site_account_id")
     task_site_id = task.get("task_id")
 
-    # Site pe check endpoint call
-    await loop.run_in_executor(
+    # Site pe check call
+    chk_code, chk_resp = await loop.run_in_executor(
         None, site, "POST", "/api/tasks/check",
         {"channel": "whatsapp", "account_id": site_account_id}, idx)
-    await asyncio.sleep(20)
+    logger.info(f"[WS CHECK-CALL] uid={uid} http={chk_code} resp={chk_resp}")
 
-    # Method 1: task status directly check karo
+    await asyncio.sleep(5)
+
     verified = False
     points_earned = 0
 
+    # Method 1: /api/tasks/current → status check
     _, task_status = await loop.run_in_executor(
-        None, site, "GET", "/api/tasks/current?channel=whatsapp", None, idx)
+        None, site, "GET",
+        f"/api/tasks/current?channel=whatsapp&account_id={site_account_id}", None, idx)
     current_task = task_status.get("data", {})
     current_status = current_task.get("status", "")
-
-    logger.info(f"[WS CHECK] uid={uid} task_id={task_site_id} current_status={current_status}")
+    logger.info(f"[WS CHECK-CURRENT] uid={uid} task_id={task_site_id} status={current_status} full={task_status}")
 
     if current_status == "completed":
         verified = True
-        points_earned = current_task.get("reward_points", 0)
+        points_earned = current_task.get("reward_points", 0) or current_task.get("reward_min_points", 0)
     else:
-        # Method 2: reward_points compare via /api/ws/status
+        # Method 2: reward_points compare
         _, status_data = await loop.run_in_executor(
             None, site, "GET", f"/api/ws/status?account_id={site_account_id}", None, idx)
         binding = status_data.get("data", {}).get("binding", {})
         reward_now = binding.get("reward_points", 0)
         reward_at_claim = task.get("reward_points_at_claim", 0)
-        logger.info(f"[WS CHECK] reward_at_claim={reward_at_claim} reward_now={reward_now}")
+        logger.info(f"[WS CHECK-POINTS] reward_at_claim={reward_at_claim} reward_now={reward_now} binding={binding}")
         if reward_now > reward_at_claim:
             verified = True
             points_earned = reward_now - reward_at_claim
 
     if verified:
+        # Timer extend — task expires_at aage badha do
+        new_expires = datetime.now() + timedelta(seconds=WS_TASK_TIMEOUT)
         done = await ws_tasks_col.find_one_and_update(
             {"_id": task["_id"], "status": "pending"},
             {"$set": {"status": "completed", "completed_at": datetime.now(),
+                      "expires_at": new_expires,
                       "reward_points_earned": points_earned}})
         await free_slot(idx, "wa")
         if not done:
@@ -837,8 +852,8 @@ async def cb_ws_task_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "❌ *Verify nahi hua*\n\n"
             "• WhatsApp pe message bheja?\n"
             "• Sahi number pe bheja?\n"
-            "• Sahi WhatsApp account se bheja?\n\n"
-            "30 second baad dobara check karo.",
+            "• Sahi WA account se bheja?\n\n"
+            "Bhejo phir dobara check karo.",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔄 Dobara Check Karo", callback_data=f"ws_done_{tid}")]
