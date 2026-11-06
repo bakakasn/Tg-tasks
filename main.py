@@ -719,15 +719,20 @@ async def start_ws_task(uid, acc, msg):
 
 def clean_ad_copy(text):
     """
-    Site se aane wala message EXACTLY preserve karo.
-    Sirf \r\n → \n convert karo (Windows line endings).
-    Extra spaces ya formatting mat hatao — site exact match karta hai.
+    Display ke liye sirf \r\n → \n (taaki Telegram mein sahi dikhe).
+    Lekin wa.me link ke liye RAW original use hoga — is function ka use
+    sirf display ke liye hai, verification ke liye raw_ad_copy use karo.
     """
     if not text:
         return ""
-    # Windows line endings fix
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-    return text
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+def raw_ad_copy(text):
+    """
+    WA pe bhejne ke liye EXACT original text — koi change nahi.
+    Site isi se match karta hai.
+    """
+    return text or ""
 
 async def _send_ws_task(msg, task, time_left):
     mins, secs = time_left // 60, time_left % 60
@@ -737,7 +742,9 @@ async def _send_ws_task(msg, task, time_left):
 
     # wa.me link mein message pre-fill karo — click pe WA khulega with message ready
     import urllib.parse
-    wa_link = f"https://wa.me/{target}?text={urllib.parse.quote(ad_copy)}" if target else ""
+    # wa.me link mein EXACT original message — site isi se match karta hai
+    original_copy = raw_ad_copy(task.get("ad_copy", ""))
+    wa_link = f"https://wa.me/{target}?text={urllib.parse.quote(original_copy)}" if target else ""
 
     text = (
         f"💬 *WHATSAPP TASK*\n"
