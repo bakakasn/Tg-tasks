@@ -1006,10 +1006,10 @@ async def got_wa_phone(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"⏰ Valid: {mins}m {secs}s\n\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"*WhatsApp pe yeh karo:*\n\n"
-            f"1⃣ WhatsApp app kholo\n"
-            f"2⃣ 3 dots (⋮) → Linked Devices\n"
-            f"3⃣ *Link with Phone Number* dabao\n"
-            f"4⃣ Upar diya hua code enter karo\n\n"
+            f"1️⃣ WhatsApp app kholo\n"
+            f"2️⃣ 3 dots (⋮) → Linked Devices\n"
+            f"3️⃣ *Link with Phone Number* dabao\n"
+            f"4️⃣ Upar diya hua code enter karo\n\n"
             f"⚠ *{mins} minute ke andar enter karo!*",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[
@@ -1656,6 +1656,88 @@ async def got_w_upi(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown")
     return ConversationHandler.END
 
+# ══════════════════════════════════════════════════════
+#  ADMIN PANEL  (/admin)
+# ══════════════════════════════════════════════════════
+def kb_admin_panel(refresh=False):
+    label = "🔄 Refresh All IDs" if refresh else "🔍 Check All IDs"
+    return InlineKeyboardMarkup([[InlineKeyboardButton(label, callback_data="admp_checkall")]])
+
+async def cmd_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    await update.message.reply_text(
+        "🛠 ADMIN PANEL\n\n"
+        f"🍪 Cookies loaded: {len(JARS)}\n\n"
+        "Website pe jitne bhi accounts hain unki ID dekhne ke liye button dabao 👇",
+        reply_markup=kb_admin_panel())
+
+async def cb_admp_checkall(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Sabhi cookies se website ke saare TG accounts (ID, name, phone, status) dikhao"""
+    q = update.callback_query
+    if q.from_user.id != ADMIN_ID:
+        await q.answer("❌ Sirf admin!", show_alert=True); return
+    await q.answer("⏳ Fetch ho raha hai...")
+    await q.edit_message_text("⏳ Website se saari IDs la rahe hain...")
+
+    loop = asyncio.get_event_loop()
+
+    # Bot DB me jo accounts linked hain (cookie_idx, site_id) → user id
+    linked = {}
+    async for a in accounts_col.find({"status": "accepted"}):
+        linked[(a.get("cookie_idx", 0), a.get("site_account_id"))] = a["uid"]
+
+    lines = ["📋 WEBSITE ACCOUNTS — ALL IDs", ""]
+    total = online_n = 0
+
+    for idx in range(len(JARS)):
+        try:
+            code, data = await loop.run_in_executor(
+                None, site, "GET", "/api/telegram/accounts", None, idx)
+        except Exception as e:
+            lines += [f"🍪 Cookie {idx+1}", f"  ❌ Error: {e}", ""]
+            continue
+
+        accs = data.get("data") if isinstance(data, dict) else None
+        if code != 200 or not isinstance(accs, list):
+            lines += [f"🍪 Cookie {idx+1}",
+                      f"  ⚠ Response {code} (cookie expire ho sakti hai)", ""]
+            continue
+
+        lines.append(f"🍪 Cookie {idx+1} — {len(accs)} accounts")
+        for acc in accs:
+            is_online = bool(acc.get("online"))
+            total += 1
+            online_n += 1 if is_online else 0
+            name = (acc.get("display_name") or acc.get("username")
+                    or acc.get("first_name") or "N/A")
+            phone = acc.get("requested_phone") or acc.get("phone") or "N/A"
+            sid = acc.get("id")
+            status = "✅ Online" if is_online else "❌ Offline"
+            owner = linked.get((idx, sid))
+            bot_tag = f" | 🤖 User {owner}" if owner else " | ⚪ Bot me nahi"
+            lines.append(f"  ID: {sid} | {name} | +{phone} | {status}{bot_tag}")
+        lines.append("")
+
+    lines.append(f"📊 Total: {total} | ✅ Online: {online_n} | ❌ Offline: {total - online_n}")
+
+    # Telegram limit 4096 chars — chunks me todo
+    chunks, cur = [], ""
+    for ln in lines:
+        if len(cur) + len(ln) + 1 > 3800:
+            chunks.append(cur); cur = ""
+        cur += ln + "\n"
+    if cur:
+        chunks.append(cur)
+
+    for i, chunk in enumerate(chunks):
+        last = (i == len(chunks) - 1)
+        markup = kb_admin_panel(refresh=True) if last else None
+        if i == 0:
+            await q.edit_message_text(chunk, reply_markup=markup)
+        else:
+            await ctx.bot.send_message(q.message.chat_id, chunk, reply_markup=markup)
+
 async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     tg = ctx.user_data.pop("tg_client", None)
     if tg:
@@ -1710,6 +1792,8 @@ async def run_bot():
 
     # ── Core handlers ──────────────────────────────────
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("admin", cmd_admin))
+    app.add_handler(CallbackQueryHandler(cb_admp_checkall, pattern="^admp_checkall$"))
     app.add_handler(add_conv)
     app.add_handler(add_wa_conv)
     app.add_handler(w_conv)
