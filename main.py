@@ -1647,7 +1647,7 @@ async def got_w_upi(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     payout = amt - WITHDRAW_TAX
-    await withdraw_col.insert_one({
+    wd_res = await withdraw_col.insert_one({
         "uid": uid, "amount": amt, "tax": WITHDRAW_TAX, "payout": payout,
         "upi": upi, "status": "pending", "requested_at": datetime.now()
     })
@@ -1667,7 +1667,8 @@ async def got_w_upi(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"🧾 Tax: ₹{WITHDRAW_TAX:.2f}\n"
         f"✅ *Pay karna hai: ₹{payout:.2f}*\n"
         f"📲 `{upi}`",
-        parse_mode="Markdown")
+        parse_mode="Markdown",
+        reply_markup=kb_wd_actions(wd_res.inserted_id))
     return ConversationHandler.END
 
 # ══════════════════════════════════════════════════════
@@ -1675,7 +1676,10 @@ async def got_w_upi(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ══════════════════════════════════════════════════════
 def kb_admin_panel(refresh=False):
     label = "🔄 Refresh All IDs" if refresh else "🔍 Check All IDs"
-    return InlineKeyboardMarkup([[InlineKeyboardButton(label, callback_data="admp_checkall")]])
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(label, callback_data="admp_checkall")],
+        [InlineKeyboardButton("💸 Pending Withdrawals", callback_data="admp_wd")],
+    ])
 
 async def cmd_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
@@ -1752,6 +1756,100 @@ async def cb_admp_checkall(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         else:
             await ctx.bot.send_message(q.message.chat_id, chunk, reply_markup=markup)
 
+# ── Admin: Withdrawal management ─────────────────────
+def kb_wd_actions(wid):
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Paid (Accept)", callback_data=f"wd_ok_{wid}"),
+        InlineKeyboardButton("❌ Reject (Refund)", callback_data=f"wd_no_{wid}"),
+    ]])
+
+def wd_text(w):
+    amount = w.get("amount", 0)
+    tax = w.get("tax", 0)
+    payout = w.get("payout", amount)
+    when = w.get("requested_at")
+    when_s = when.strftime("%d/%m %H:%M") if when else "-"
+    return (
+        f"💸 WITHDRAWAL REQUEST\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 User: {w.get('uid')}\n"
+        f"💰 Amount: ₹{amount:.2f}\n"
+        f"🧾 Tax: ₹{tax:.2f}\n"
+        f"✅ Pay karna hai: ₹{payout:.2f}\n"
+        f"📲 UPI: {w.get('upi')}\n"
+        f"🕐 {when_s}"
+    )
+
+async def cb_admp_wd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Admin panel: saari pending withdrawals, har ek ke saath Paid/Reject button"""
+    q = update.callback_query
+    if q.from_user.id != ADMIN_ID:
+        await q.answer("❌ Sirf admin!", show_alert=True); return
+    await q.answer()
+
+    pend = await withdraw_col.find({"status": "pending"}).sort("requested_at", 1).to_list(30)
+    if not pend:
+        await q.edit_message_text(
+            "✅ Koi pending withdrawal nahi hai.", reply_markup=kb_admin_panel())
+        return
+
+    total = sum(w.get("payout", w.get("amount", 0)) for w in pend)
+    await q.edit_message_text(
+        f"💸 Pending Withdrawals: {len(pend)}\n"
+        f"💰 Total pay karna hai: ₹{total:.2f}\n\n"
+        f"Neeche har request ke saath Paid / Reject button hai 👇",
+        reply_markup=kb_admin_panel())
+
+    for w in pend:
+        await ctx.bot.send_message(
+            q.message.chat_id, wd_text(w), reply_markup=kb_wd_actions(w["_id"]))
+
+async def cb_wd_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """wd_ok_<id> = Paid, wd_no_<id> = Reject + balance refund"""
+    q = update.callback_query
+    if q.from_user.id != ADMIN_ID:
+        await q.answer("❌ Sirf admin!", show_alert=True); return
+
+    _, action, wid = q.data.split("_", 2)
+    new_status = "paid" if action == "ok" else "rejected"
+
+    # Atomic: sirf pending wali hi update hogi (double click safe)
+    w = await withdraw_col.find_one_and_update(
+        {"_id": ObjectId(wid), "status": "pending"},
+        {"$set": {"status": new_status, "processed_at": datetime.now()}})
+    if not w:
+        await q.answer("ℹ Ye request pehle hi process ho chuki hai.", show_alert=True)
+        try: await q.edit_message_reply_markup(reply_markup=None)
+        except Exception: pass
+        return
+    await q.answer("✅ Done")
+
+    uid = w["uid"]
+    amount = w.get("amount", 0)
+    payout = w.get("payout", amount)
+
+    if new_status == "paid":
+        tag = "\n\n✅ PAID / ACCEPTED"
+        user_msg = (
+            f"✅ Aapka withdrawal accept ho gaya!\n\n"
+            f"💰 ₹{payout:.2f} aapke UPI ({w.get('upi')}) pe bhej diye gaye hain.")
+    else:
+        await add_bal(uid, amount)   # poora amount wapas
+        tag = "\n\n❌ REJECTED (balance refund ho gaya)"
+        user_msg = (
+            f"❌ Aapka withdrawal reject ho gaya.\n\n"
+            f"💰 ₹{amount:.2f} aapke balance me wapas add kar diye gaye hain.")
+
+    try:
+        await ctx.bot.send_message(uid, user_msg)
+    except Exception as e:
+        logger.warning(f"[WD NOTIFY] {e}")
+
+    try:
+        await q.edit_message_text((q.message.text or "") + tag)
+    except Exception:
+        pass
+
 async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     tg = ctx.user_data.pop("tg_client", None)
     if tg:
@@ -1808,6 +1906,8 @@ async def run_bot():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("admin", cmd_admin))
     app.add_handler(CallbackQueryHandler(cb_admp_checkall, pattern="^admp_checkall$"))
+    app.add_handler(CallbackQueryHandler(cb_admp_wd, pattern="^admp_wd$"))
+    app.add_handler(CallbackQueryHandler(cb_wd_action, pattern="^wd_(ok|no)_"))
     app.add_handler(add_conv)
     app.add_handler(add_wa_conv)
     app.add_handler(w_conv)
