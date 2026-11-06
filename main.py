@@ -434,6 +434,7 @@ async def start_tg_task(uid, acc, msg):
 
 async def _send_tg_task(msg, task, time_left):
     mins, secs = time_left // 60, time_left % 60
+    ad_copy = clean_ad_copy(task.get("ad_copy", ""))
     text = (
         f"📋 *TELEGRAM TASK*\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -443,7 +444,7 @@ async def _send_tg_task(msg, task, time_left):
         f"💰 *Reward:* ₹{TASK_REWARD:.2f}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📝 *Yeh message bhejo:*\n\n"
-        f"`{task['ad_copy']}`\n\n"
+        f"{ad_copy}\n\n"
         f"👆 Copy karo, Telegram number pe bhejo, phir Done dabao."
     )
     await msg.reply_text(
@@ -472,11 +473,11 @@ async def cb_task_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("⏰ *Task expire ho gaya!*\n\nNaya task lo.", parse_mode="Markdown")
         return
 
-    await q.edit_message_text("⏳ Verify ho raha hai... (10 sec)")
+    await q.edit_message_text("⏳ Verify ho raha hai... (20 sec)")
     loop = asyncio.get_event_loop()
 
     await loop.run_in_executor(None, site, "POST", "/api/tasks/check", {"channel": "telegram"}, idx)
-    await asyncio.sleep(10)
+    await asyncio.sleep(20)
 
     _, me_now = await loop.run_in_executor(None, site, "GET", "/api/me", None, idx)
     bal_now = me_now.get("data", {}).get("points_balance", 0)
@@ -709,12 +710,23 @@ async def start_ws_task(uid, acc, msg):
         await free_slot(idx, "wa")
         await msg.reply_text("❌ Error aaya, dobara try karo.")
 
+def clean_ad_copy(text):
+    """Remove escape characters and extra whitespace from ad_copy"""
+    if not text:
+        return ""
+    # \r\n → newline, \n → newline, \r → newline
+    text = text.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\r", "\n").replace("\r\n", "\n").replace("\r", "\n")
+    # Multiple blank lines → max 2
+    import re
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
 async def _send_ws_task(msg, task, time_left):
     mins, secs = time_left // 60, time_left % 60
     target = task.get("target_phone", "")
     username = task.get("target_username", "")
+    ad_copy = clean_ad_copy(task.get("ad_copy", ""))
 
-    # WhatsApp direct link
     wa_link = f"https://wa.me/{target}" if target else ""
 
     text = (
@@ -730,7 +742,7 @@ async def _send_ws_task(msg, task, time_left):
         f"💰 *Reward:* ₹{WS_TASK_REWARD:.2f}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📝 *Yeh message WhatsApp pe bhejo:*\n\n"
-        f"`{task['ad_copy']}`\n\n"
+        f"{ad_copy}\n\n"
         f"👆 Copy karo, is number pe WhatsApp message bhejo, phir Done dabao."
     )
 
@@ -767,37 +779,53 @@ async def cb_ws_task_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("⏰ *Task expire ho gaya!*\n\nNaya WA task lo.", parse_mode="Markdown")
         return
 
-    await q.edit_message_text("⏳ WhatsApp verify ho raha hai... (15 sec)")
+    await q.edit_message_text("⏳ WhatsApp verify ho raha hai... (20 sec)")
     loop = asyncio.get_event_loop()
     site_account_id = task.get("site_account_id")
+    task_site_id = task.get("task_id")
 
     # Site pe check endpoint call
     await loop.run_in_executor(
-        None, site, "POST", "/api/tasks/check", {"channel": "whatsapp"}, idx)
-    await asyncio.sleep(15)
+        None, site, "POST", "/api/tasks/check",
+        {"channel": "whatsapp", "account_id": site_account_id}, idx)
+    await asyncio.sleep(20)
 
-    # reward_points compare via /api/ws/status
-    _, status_data = await loop.run_in_executor(
-        None, site, "GET", f"/api/ws/status?account_id={site_account_id}", None, idx)
+    # Method 1: task status directly check karo
+    verified = False
+    points_earned = 0
 
-    binding = status_data.get("data", {}).get("binding", {})
-    reward_now = binding.get("reward_points", 0)
-    reward_at_claim = task.get("reward_points_at_claim", 0)
+    _, task_status = await loop.run_in_executor(
+        None, site, "GET", "/api/tasks/current?channel=whatsapp", None, idx)
+    current_task = task_status.get("data", {})
+    current_status = current_task.get("status", "")
 
-    logger.info(f"[WS CHECK] uid={uid} cookie={idx} account_id={site_account_id} "
-                f"reward_at_claim={reward_at_claim} reward_now={reward_now}")
+    logger.info(f"[WS CHECK] uid={uid} task_id={task_site_id} current_status={current_status}")
 
-    if reward_now > reward_at_claim:
+    if current_status == "completed":
+        verified = True
+        points_earned = current_task.get("reward_points", 0)
+    else:
+        # Method 2: reward_points compare via /api/ws/status
+        _, status_data = await loop.run_in_executor(
+            None, site, "GET", f"/api/ws/status?account_id={site_account_id}", None, idx)
+        binding = status_data.get("data", {}).get("binding", {})
+        reward_now = binding.get("reward_points", 0)
+        reward_at_claim = task.get("reward_points_at_claim", 0)
+        logger.info(f"[WS CHECK] reward_at_claim={reward_at_claim} reward_now={reward_now}")
+        if reward_now > reward_at_claim:
+            verified = True
+            points_earned = reward_now - reward_at_claim
+
+    if verified:
         done = await ws_tasks_col.find_one_and_update(
             {"_id": task["_id"], "status": "pending"},
             {"$set": {"status": "completed", "completed_at": datetime.now(),
-                      "reward_points_earned": reward_now - reward_at_claim}})
+                      "reward_points_earned": points_earned}})
         await free_slot(idx, "wa")
         if not done:
             await q.edit_message_text("ℹ Task already process ho chuka hai."); return
         await add_bal(uid, WS_TASK_REWARD)
         u = await get_user(uid)
-        points_earned = reward_now - reward_at_claim
         await q.edit_message_text(
             f"✅ *WA TASK COMPLETE!*\n\n"
             f"💰 +₹{WS_TASK_REWARD:.2f} mili!\n"
@@ -810,7 +838,7 @@ async def cb_ws_task_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "• WhatsApp pe message bheja?\n"
             "• Sahi number pe bheja?\n"
             "• Sahi WhatsApp account se bheja?\n\n"
-            "Message bhejo phir dobara check karo.",
+            "30 second baad dobara check karo.",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔄 Dobara Check Karo", callback_data=f"ws_done_{tid}")]
