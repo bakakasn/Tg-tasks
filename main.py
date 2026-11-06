@@ -1683,7 +1683,6 @@ async def run_bot():
 
     # WA Admin
     app.add_handler(CommandHandler("wsaccounts", cmd_ws_accounts))
-    app.add_handler(CommandHandler("addws", cmd_add_ws))
     app.add_handler(CommandHandler("delws", cmd_del_ws))
     app.add_handler(CallbackQueryHandler(cb_wsadm_edit,   pattern="^wsadm_ed_"))
     app.add_handler(CallbackQueryHandler(cb_wsadm_ckpick, pattern="^wsadm_ckp_"))
