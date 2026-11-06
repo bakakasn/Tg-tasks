@@ -735,7 +735,9 @@ async def _send_ws_task(msg, task, time_left):
     username = task.get("target_username", "")
     ad_copy = clean_ad_copy(task.get("ad_copy", ""))
 
-    wa_link = f"https://wa.me/{target}" if target else ""
+    # wa.me link mein message pre-fill karo — click pe WA khulega with message ready
+    import urllib.parse
+    wa_link = f"https://wa.me/{target}?text={urllib.parse.quote(ad_copy)}" if target else ""
 
     text = (
         f"💬 *WHATSAPP TASK*\n"
