@@ -805,25 +805,37 @@ async def cb_ws_task_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     verified = False
     points_earned = 0
 
-    # Method 1: /api/tasks/current → status check
-    _, task_status = await loop.run_in_executor(
-        None, site, "GET",
-        f"/api/tasks/current?channel=whatsapp&account_id={site_account_id}", None, idx)
-    current_task = task_status.get("data", {})
-    current_status = current_task.get("status", "")
-    logger.info(f"[WS CHECK-CURRENT] uid={uid} task_id={task_site_id} status={current_status} full={task_status}")
+    # Method 0: /api/tasks/check ka response directly dekho
+    chk_data = chk_resp.get("data", {})
+    chk_status = chk_data.get("status", "") if isinstance(chk_data, dict) else ""
+    chk_ok = chk_resp.get("ok", False)
+    logger.info(f"[WS CHECK-M0] chk_ok={chk_ok} chk_status={chk_status} chk_data={chk_data}")
 
-    if current_status == "completed":
+    if chk_ok and chk_status == "completed":
         verified = True
-        points_earned = current_task.get("reward_points", 0) or current_task.get("reward_min_points", 0)
-    else:
-        # Method 2: reward_points compare
+        points_earned = chk_data.get("reward_points", 0) or chk_data.get("total_reward_points", 0)
+
+    if not verified:
+        # Method 1: /api/tasks/current → status check
+        _, task_status = await loop.run_in_executor(
+            None, site, "GET",
+            f"/api/tasks/current?channel=whatsapp&account_id={site_account_id}", None, idx)
+        current_task = task_status.get("data", {})
+        current_status = current_task.get("status", "")
+        logger.info(f"[WS CHECK-M1] status={current_status} data={current_task}")
+
+        if current_status == "completed":
+            verified = True
+            points_earned = current_task.get("reward_points", 0) or current_task.get("total_reward_points", 0)
+
+    if not verified:
+        # Method 2: reward_points compare via /api/ws/status
         _, status_data = await loop.run_in_executor(
             None, site, "GET", f"/api/ws/status?account_id={site_account_id}", None, idx)
         binding = status_data.get("data", {}).get("binding", {})
         reward_now = binding.get("reward_points", 0)
         reward_at_claim = task.get("reward_points_at_claim", 0)
-        logger.info(f"[WS CHECK-POINTS] reward_at_claim={reward_at_claim} reward_now={reward_now} binding={binding}")
+        logger.info(f"[WS CHECK-M2] reward_at_claim={reward_at_claim} reward_now={reward_now}")
         if reward_now > reward_at_claim:
             verified = True
             points_earned = reward_now - reward_at_claim
