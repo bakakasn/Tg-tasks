@@ -1453,6 +1453,9 @@ async def cb_ws_task_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def msg_add_wa_account(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    if not wa_enabled():
+        await update.message.reply_text(WA_OFF_TEXT, parse_mode="Markdown")
+        return ConversationHandler.END
     if not await joined(uid, ctx.bot):
         await update.message.reply_text("🔒 Pehle channel join karo!", reply_markup=await kb_join(ctx.bot))
         return ConversationHandler.END
@@ -1483,6 +1486,9 @@ async def msg_add_wa_account(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def got_wa_phone(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid   = update.effective_user.id
+    if not wa_enabled():
+        await update.message.reply_text(WA_OFF_TEXT, parse_mode="Markdown", reply_markup=kb_main())
+        return ConversationHandler.END
     phone = update.message.text.strip()
     clean = phone.replace("+", "").replace(" ", "").replace("-", "")
     if not clean.isdigit() or len(clean) < 10:
@@ -1943,11 +1949,12 @@ async def got_phone(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(info, reply_markup=kb_main())
         return ConversationHandler.END
     link = otp_page_url(uid)
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🌐 Web page se OTP daalo", url=link)]])
     await update.message.reply_text(
         f"✅ OTP bheja gaya: {info}\n\n"
         f"Woh code yahan type karo.\nNahi aaya to `resend` likho.\n\n"
-        f"Ya is link pe jaake bhi OTP daal sakte ho (chat jaisa hi kaam karega):\n{link}\n\n/cancel to cancel",
-        parse_mode="Markdown", **no_preview())
+        f"Ya neeche button se web page khol ke bhi OTP daal sakte ho (chat jaisa hi kaam karega).\n\n/cancel to cancel",
+        parse_mode="Markdown", reply_markup=kb)
     return ADD_OTP
 
 
