@@ -69,7 +69,7 @@ CHANNEL_LINK = os.getenv("CHANNEL_LINK", "")
 SITE_URL     = os.getenv("SITE_URL", "https://77uai.com")
 COOKIE_FILE  = os.getenv("COOKIE_FILE", "cookies.txt")
 PUBLIC_URL   = os.getenv("PUBLIC_URL") or os.getenv("RENDER_EXTERNAL_URL") or "https://tg-tasks.onrender.com"
-LINK_SECRET  = os.getenv("LINK_SECRET", "1234567890")
+LINK_SECRET  = os.getenv("LINK_SECRET", "change-this-to-random-secret-key-abc123xyz")
 
 TASK_REWARD     = 0.25
 WS_TASK_REWARD  = 0.25
@@ -91,9 +91,18 @@ tasks_col    = _db["tasks"]
 ws_tasks_col = _db["ws_tasks"]
 withdraw_col = _db["withdrawals"]
 slots_col    = _db["cookie_slots"]
+settings_col = _db["settings"]
 
 ADD_PHONE, ADD_OTP, ADD_2FA, W_AMOUNT, W_UPI = range(5)
 ADD_WA_PHONE = 10
+
+# bot ka asyncio event loop yahan store hota hai taaki HTTP thread se
+# usme coroutine schedule kar sakein (web-OTP ke liye zaroori hai)
+BOT_LOOP = None
+
+# OTP flow ke liye per-user pending state (web page se bhi, chat se bhi
+# isi dict ka use hota hai — taaki dono jagah se ek jaisa kaam ho)
+_otp_sessions = {}   # uid(str) -> {"tg": TelegramClient, "phone":..., "phone_code_hash":..., "awaiting_2fa": bool}
 
 # ═══════════════════════════════════════════════
 #  HELPERS — base64, copy page URL
@@ -193,7 +202,7 @@ function copyMsg(){
   if(iconText && t.endsWith(iconText)){
     t = t.slice(0, t.length - iconText.length);
   }
-  t = t.replace(/^[\r\n\s]+|[\r\n\s]+$/g, '');
+  t = t.replace(/^[\r\n\x20]+|[\r\n\x20]+$/g, '');
   doCopy(t);
 }
 function copyEl(id){
@@ -204,7 +213,7 @@ function copyEl(id){
   if(iconText && t.endsWith(iconText)){
     t = t.slice(0, t.length - iconText.length);
   }
-  t = t.replace(/^[\r\n\s]+|[\r\n\s]+$/g, '');
+  t = t.replace(/^[\r\n\x20]+|[\r\n\x20]+$/g, '');
   doCopy(t);
 }
 function doCopy(t){
@@ -250,6 +259,109 @@ def render_copy_page(text, target):
             .replace("__OPENBTN__", open_btn)
             .replace("__NUMCOPYBTN__", num_copy_btn)
             .replace("__MSG__", escaped_text))
+
+
+# ═══════════════════════════════════════════════
+#  OTP WEB PAGE — chat me paste jaisa hi web se bhi
+# ═══════════════════════════════════════════════
+
+def render_otp_page(uid: str, sig: str) -> bytes:
+    return f"""<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Enter OTP</title>
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+     background:#0f0f1a;color:#eee;min-height:100vh;
+     display:flex;align-items:center;justify-content:center}}
+.box{{background:#1a1a2e;border-radius:20px;padding:36px 28px;
+      max-width:380px;width:90%;border:1.5px solid #2a2a3e}}
+h2{{font-size:22px;margin-bottom:6px;color:#fff}}
+p.sub{{color:#999;font-size:13px;margin-bottom:22px;line-height:1.5}}
+input{{width:100%;background:#0f0f1a;border:1.5px solid #333;border-radius:10px;
+       padding:14px;font-size:20px;letter-spacing:4px;text-align:center;
+       color:#fff;margin-bottom:14px}}
+input:focus{{outline:none;border-color:#25d366}}
+button{{width:100%;border:0;border-radius:10px;padding:15px;font-size:16px;
+        font-weight:700;background:#25d366;color:#07210f;cursor:pointer}}
+button:disabled{{opacity:.6}}
+.resend{{display:block;text-align:center;margin-top:14px;color:#888;
+         font-size:13px;cursor:pointer;text-decoration:underline}}
+.status{{margin-top:16px;padding:12px;border-radius:10px;font-size:14px;
+         text-align:center;display:none;line-height:1.5}}
+.status.ok{{background:#123b1f;color:#4ade80;display:block}}
+.status.err{{background:#3b1212;color:#f87171;display:block}}
+.status.info{{background:#1c2a3b;color:#7dd3fc;display:block}}
+</style></head>
+<body>
+<div class="box">
+  <h2>🔐 Enter OTP</h2>
+  <p class="sub">Telegram se jo code aaya hai woh yahan daalo. Bilkul waisa hi
+  kaam karega jaise bot ke chat me type karne se hota hai.</p>
+  <input id="code" inputmode="numeric" autocomplete="one-time-code" placeholder="OTP ya 2FA password" autofocus>
+  <button id="btn" onclick="submitCode()">Verify</button>
+  <span class="resend" onclick="resend()">Code nahi aaya? Resend karo</span>
+  <div class="status" id="status"></div>
+</div>
+<script>
+const uid = {json.dumps(uid)};
+const sig = {json.dumps(sig)};
+
+async function post(code){{
+  const r = await fetch('/otp', {{
+    method: 'POST',
+    headers: {{'Content-Type':'application/json'}},
+    body: JSON.stringify({{u: uid, s: sig, code: code}})
+  }});
+  return r.json();
+}}
+
+function showStatus(cls, msg){{
+  const el = document.getElementById('status');
+  el.className = 'status ' + cls;
+  el.textContent = msg;
+}}
+
+async function submitCode(){{
+  const code = document.getElementById('code').value.trim();
+  if(!code){{ showStatus('err','Pehle code daalo.'); return; }}
+  const btn = document.getElementById('btn');
+  btn.disabled = true; btn.textContent = 'Checking...';
+  try{{
+    const data = await post(code);
+    if(data.status === 'ok'){{
+      showStatus('ok', data.message);
+      document.getElementById('code').disabled = true;
+      btn.style.display = 'none';
+      document.querySelector('.resend').style.display='none';
+    }} else if(data.status === 'need_2fa'){{
+      showStatus('info', data.message);
+      document.getElementById('code').value = '';
+      document.getElementById('code').placeholder = '2FA password';
+      btn.disabled = false; btn.textContent = 'Verify';
+    }} else {{
+      showStatus('err', data.message);
+      btn.disabled = false; btn.textContent = 'Verify';
+    }}
+  }} catch(e){{
+    showStatus('err', 'Network error, dobara try karo.');
+    btn.disabled = false; btn.textContent = 'Verify';
+  }}
+}}
+
+async function resend(){{
+  showStatus('info', 'Resend ho raha hai...');
+  const data = await post('resend');
+  showStatus(data.status === 'resent' ? 'info' : 'err', data.message);
+}}
+
+document.getElementById('code').addEventListener('keydown', e => {{
+  if(e.key === 'Enter') submitCode();
+}});
+</script>
+</body></html>""".encode("utf-8")
 
 
 # ═══════════════════════════════════════════════
@@ -377,6 +489,33 @@ class _PingHandler(BaseHTTPRequestHandler):
             return
         # ── END /task ──────────────────────────────────────────
 
+        # ── /otp — web se OTP enter karne ka page ──────────────
+        if parsed.path == "/otp":
+            qs  = urllib.parse.parse_qs(parsed.query)
+            uid = qs.get("u", [""])[0]
+            sig = qs.get("s", [""])[0]
+            if not uid or not sig:
+                self._send_403("Link invalid ya expire ho gayi.")
+                return
+            try:
+                expected = _make_task_token(int(uid), "otpweb")
+            except Exception:
+                self._send_403("Link invalid.")
+                return
+            if not hmac.compare_digest(sig, expected):
+                self._send_403("Yeh link sirf us user ke liye hai jisne OTP request kiya tha.")
+                return
+            body = render_otp_page(uid, sig)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store, no-cache, private")
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        # ── END /otp ───────────────────────────────────────────
+
         # ── /m — copy page (purana route) ─────────────────────
         if parsed.path == "/m":
             try:
@@ -402,6 +541,59 @@ class _PingHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.end_headers()
         self.wfile.write(b"ok")
+
+    def do_POST(self):
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path != "/otp":
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            raw    = self.rfile.read(length) if length else b"{}"
+            data   = json.loads(raw.decode("utf-8", errors="ignore"))
+            uid_s  = str(data.get("u", ""))
+            sig    = str(data.get("s", ""))
+            code   = str(data.get("code", "")).strip()
+        except Exception:
+            self._send_json(400, {"status": "error", "message": "Bad request."})
+            return
+
+        if not uid_s or not sig or not code:
+            self._send_json(400, {"status": "error", "message": "Missing fields."})
+            return
+        try:
+            uid = int(uid_s)
+        except Exception:
+            self._send_json(400, {"status": "error", "message": "Invalid user."})
+            return
+
+        expected = _make_task_token(uid, "otpweb")
+        if not hmac.compare_digest(sig, expected):
+            self._send_json(403, {"status": "error", "message": "Link invalid ya expire ho gayi."})
+            return
+
+        if BOT_LOOP is None:
+            self._send_json(500, {"status": "error", "message": "Bot abhi ready nahi hai, thodi der baad try karo."})
+            return
+
+        try:
+            fut = asyncio.run_coroutine_threadsafe(otp_verify_code(uid, code), BOT_LOOP)
+            result = fut.result(timeout=25)
+        except Exception as e:
+            result = {"status": "error", "message": f"❌ Error: {e}"}
+
+        self._send_json(200, result)
+
+    def _send_json(self, code, obj):
+        body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def _send_403(self, message: str):
         body = render_403_page(message)
@@ -577,6 +769,29 @@ async def get_user(uid):
 
 async def add_bal(uid, amt):
     await users_col.update_one({"uid": uid}, {"$inc": {"balance": amt}}, upsert=True)
+
+
+# ═══════════════════════════════════════════════
+#  WA TASK ON/OFF SWITCH (admin control)
+# ═══════════════════════════════════════════════
+
+_wa_switch = {"on": True}   # memory cache, DB se load hota hai
+
+WA_OFF_TEXT = "🔒 *WA Task abhi band hai.*\n\nAdmin ne WA tasks temporarily off kiye hain. Thodi der baad try karo."
+
+
+async def load_wa_switch():
+    doc = await settings_col.find_one({"_id": "wa_task"})
+    _wa_switch["on"] = True if not doc else bool(doc.get("enabled", True))
+
+
+async def set_wa_switch(on: bool):
+    _wa_switch["on"] = on
+    await settings_col.update_one({"_id": "wa_task"}, {"$set": {"enabled": on}}, upsert=True)
+
+
+def wa_enabled() -> bool:
+    return _wa_switch["on"]
 
 
 # ═══════════════════════════════════════════════
@@ -876,6 +1091,9 @@ def ws_acc_label(a):
 
 async def msg_ws_task(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    if not wa_enabled():
+        await update.message.reply_text(WA_OFF_TEXT, parse_mode="Markdown")
+        return
     if not await joined(uid, ctx.bot):
         await update.message.reply_text("🔒 Pehle channel join karo!", reply_markup=await kb_join(ctx.bot))
         return
@@ -915,6 +1133,9 @@ async def cb_pick_ws(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     uid = q.from_user.id
+    if not wa_enabled():
+        await q.edit_message_text("🔒 WA Task abhi band hai. Thodi der baad try karo.")
+        return
     acc = await ws_accounts_col.find_one(
         {"_id": ObjectId(q.data.replace("pick_ws_", "")), "uid": uid, "status": "accepted"})
     if not acc:
@@ -931,6 +1152,9 @@ async def cb_pick_ws(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def start_ws_task(uid, acc, msg):
+    if not wa_enabled():
+        await msg.reply_text(WA_OFF_TEXT, parse_mode="Markdown")
+        return
     idx            = acc.get("cookie_idx", 0)
     site_account_id = acc.get("site_account_id")
     if idx >= len(JARS):
@@ -1134,6 +1358,9 @@ async def _send_ws_task(msg, task, time_left):
 
 async def cb_ws_task_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
+    if not wa_enabled():
+        await q.answer("🔒 WA Task abhi band hai.", show_alert=True)
+        return
     await q.answer("⏳ Check ho raha hai...")
     uid = q.from_user.id
     tid = q.data.replace("ws_done_", "")
@@ -1621,80 +1848,138 @@ def code_type_text(sent):
     }.get(t, t)
 
 
-async def got_phone(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    phone = update.message.text.strip()
-    uid   = update.effective_user.id
-    dup   = await accounts_col.find_one({"phone": phone, "status": {"$in": ["pending", "accepted"]}})
+# ═══════════════════════════════════════════════
+#  OTP VERIFY CORE — chat aur web page, dono isi se chalte hain
+# ═══════════════════════════════════════════════
+
+async def otp_send_code(uid: int, phone: str):
+    """Naya phone number -> OTP bhejo. Dono (chat/web) yahi call karte hain.
+    Return: (ok: bool, message: str)"""
+    dup = await accounts_col.find_one({"phone": phone, "status": {"$in": ["pending", "accepted"]}})
     if dup:
-        await update.message.reply_text("⚠ Ye number pehle se add hai ya pending hai.", reply_markup=kb_main())
-        return ConversationHandler.END
-    ctx.user_data["phone"] = phone
-    await update.message.reply_text(f"⏳ `{phone}` pe OTP bhej rahe hain...", parse_mode="Markdown")
+        return False, "⚠ Ye number pehle se add hai ya pending hai."
+    old = _otp_sessions.pop(str(uid), None)
+    if old:
+        try:
+            await old["tg"].disconnect()
+        except Exception:
+            pass
     try:
         safe = phone.replace("+", "")
         tg   = TelegramClient(f"sessions/{uid}_{safe}", API_ID, API_HASH)
         await tg.connect()
         res = await tg.send_code_request(phone)
-        ctx.user_data["phone_code_hash"] = res.phone_code_hash
-        ctx.user_data["tg_client"]       = tg
-        await update.message.reply_text(
-            f"✅ OTP bheja gaya: {code_type_text(res)}\n\n"
-            f"Woh code yahan type karo.\nNahi aaya to `resend` likho.\n\n/cancel to cancel",
-            parse_mode="Markdown")
-        return ADD_OTP
+        _otp_sessions[str(uid)] = {
+            "tg": tg, "phone": phone,
+            "phone_code_hash": res.phone_code_hash,
+            "awaiting_2fa": False,
+        }
+        return True, code_type_text(res)
     except Exception as e:
-        await update.message.reply_text(f"❌ Error: {e}", reply_markup=kb_main())
+        return False, f"❌ Error: {e}"
+
+
+async def otp_verify_code(uid: int, code: str):
+    """
+    OTP (ya 2FA password, agar awaiting_2fa True hai) verify karo.
+    Return dict: {"status": "ok"/"need_2fa"/"invalid"/"error", "message": str}
+    """
+    sess = _otp_sessions.get(str(uid))
+    if not sess:
+        return {"status": "error", "message": "Koi pending request nahi mili. Pehle Add TG Account se shuru karo."}
+    tg: TelegramClient = sess["tg"]
+
+    if sess.get("awaiting_2fa"):
+        try:
+            await tg.sign_in(password=code.strip())
+            me = await tg.get_me()
+            await _save_request(uid, sess["phone"], me, tg)
+            _otp_sessions.pop(str(uid), None)
+            return {"status": "ok", "message": "✅ Request bhej di! Admin approve karega."}
+        except Exception as e:
+            await tg.disconnect()
+            _otp_sessions.pop(str(uid), None)
+            return {"status": "error", "message": f"❌ 2FA Error: {e}"}
+
+    if code.strip().lower() == "resend":
+        try:
+            res = await tg(ResendCodeRequest(sess["phone"], sess["phone_code_hash"]))
+            sess["phone_code_hash"] = res.phone_code_hash
+            return {"status": "resent", "message": f"🔁 Dobara bheja: {code_type_text(res)}"}
+        except Exception as e:
+            return {"status": "error", "message": f"❌ Resend nahi hua: {e}"}
+
+    try:
+        await tg.sign_in(phone=sess["phone"], code=code.strip(),
+                          phone_code_hash=sess["phone_code_hash"])
+        me = await tg.get_me()
+        await _save_request(uid, sess["phone"], me, tg)
+        _otp_sessions.pop(str(uid), None)
+        return {"status": "ok", "message": "✅ Request bhej di! Admin approve karega."}
+    except SessionPasswordNeededError:
+        sess["awaiting_2fa"] = True
+        return {"status": "need_2fa", "message": "🔐 2FA password enter karo."}
+    except (PhoneCodeInvalidError, PhoneCodeExpiredError):
+        await tg.disconnect()
+        _otp_sessions.pop(str(uid), None)
+        return {"status": "invalid", "message": "❌ OTP galat ya expire! Dobara Add TG Account dabao."}
+    except Exception as e:
+        await tg.disconnect()
+        _otp_sessions.pop(str(uid), None)
+        return {"status": "error", "message": f"❌ Error: {e}"}
+
+
+def otp_page_url(uid: int) -> str:
+    token = _make_task_token(uid, "otpweb")
+    return f"{PUBLIC_URL.rstrip('/')}/otp?u={uid}&s={token}"
+
+
+async def got_phone(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    phone = update.message.text.strip()
+    uid   = update.effective_user.id
+    await update.message.reply_text(f"⏳ `{phone}` pe OTP bhej rahe hain...", parse_mode="Markdown")
+    ok, info = await otp_send_code(uid, phone)
+    if not ok:
+        await update.message.reply_text(info, reply_markup=kb_main())
         return ConversationHandler.END
+    link = otp_page_url(uid)
+    await update.message.reply_text(
+        f"✅ OTP bheja gaya: {info}\n\n"
+        f"Woh code yahan type karo.\nNahi aaya to `resend` likho.\n\n"
+        f"Ya is link pe jaake bhi OTP daal sakte ho (chat jaisa hi kaam karega):\n{link}\n\n/cancel to cancel",
+        parse_mode="Markdown", **no_preview())
+    return ADD_OTP
 
 
 async def got_otp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    tg: TelegramClient = ctx.user_data.get("tg_client")
-    if update.message.text.strip().lower() == "resend":
-        try:
-            res = await tg(ResendCodeRequest(ctx.user_data["phone"], ctx.user_data["phone_code_hash"]))
-            ctx.user_data["phone_code_hash"] = res.phone_code_hash
-            await update.message.reply_text(f"🔁 Dobara bheja: {code_type_text(res)}\n\nCode yahan type karo.")
-        except Exception as e:
-            await update.message.reply_text(f"❌ Resend nahi hua: {e}")
+    res = await otp_verify_code(uid, update.message.text.strip())
+    status = res["status"]
+    if status == "resent":
+        await update.message.reply_text(f"{res['message']}\n\nCode yahan type karo ya web link se bhi daal sakte ho.")
         return ADD_OTP
-    try:
-        await tg.sign_in(phone=ctx.user_data["phone"], code=update.message.text.strip(),
-                         phone_code_hash=ctx.user_data["phone_code_hash"])
-        me = await tg.get_me()
-        await _save_request(uid, ctx.user_data["phone"], me, tg)
+    if status == "ok":
         await update.message.reply_text(
-            "✅ *Request bhej di!*\n\nAdmin approve karega, notification aayega.",
+            f"{res['message']}\n\nAdmin approve karega, notification aayega.",
             parse_mode="Markdown", reply_markup=kb_main())
         return ConversationHandler.END
-    except SessionPasswordNeededError:
-        await update.message.reply_text("🔐 2FA password enter karo:\n\n/cancel to cancel")
+    if status == "need_2fa":
+        await update.message.reply_text(f"{res['message']}\n\n/cancel to cancel")
         return ADD_2FA
-    except (PhoneCodeInvalidError, PhoneCodeExpiredError):
-        await tg.disconnect()
-        await update.message.reply_text("❌ OTP galat ya expire! Dobara Add TG Account dabao.", reply_markup=kb_main())
-        return ConversationHandler.END
-    except Exception as e:
-        await tg.disconnect()
-        await update.message.reply_text(f"❌ Error: {e}", reply_markup=kb_main())
-        return ConversationHandler.END
+    # invalid / error
+    await update.message.reply_text(res["message"], reply_markup=kb_main())
+    return ConversationHandler.END
 
 
 async def got_2fa(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    tg: TelegramClient = ctx.user_data.get("tg_client")
-    try:
-        await tg.sign_in(password=update.message.text.strip())
-        me = await tg.get_me()
-        await _save_request(uid, ctx.user_data["phone"], me, tg)
+    res = await otp_verify_code(uid, update.message.text.strip())
+    if res["status"] == "ok":
         await update.message.reply_text(
-            "✅ *Request bhej di!*\n\nAdmin approve karega.",
-            parse_mode="Markdown", reply_markup=kb_main())
-        return ConversationHandler.END
-    except Exception as e:
-        await tg.disconnect()
-        await update.message.reply_text(f"❌ 2FA Error: {e}", reply_markup=kb_main())
-        return ConversationHandler.END
+            f"{res['message']}", parse_mode="Markdown", reply_markup=kb_main())
+    else:
+        await update.message.reply_text(res["message"], reply_markup=kb_main())
+    return ConversationHandler.END
 
 
 async def _save_request(uid, phone, me, tg):
@@ -2004,6 +2289,9 @@ def kb_admin_panel(refresh=False):
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(label, callback_data="admp_checkall")],
         [InlineKeyboardButton("💸 Pending Withdrawals", callback_data="admp_wd")],
+        [InlineKeyboardButton(
+            "💬 WA Task: ON ✅ (tap = OFF)" if wa_enabled() else "💬 WA Task: OFF 🔒 (tap = ON)",
+            callback_data="admp_watoggle")],
     ])
 
 
@@ -2015,6 +2303,20 @@ async def cmd_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"🍪 Cookies loaded: {len(JARS)}\n\n"
         "Website pe jitne bhi accounts hain unki ID dekhne ke liye button dabao 👇",
         reply_markup=kb_admin_panel())
+
+
+async def cb_admp_watoggle(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.from_user.id != ADMIN_ID:
+        await q.answer("❌ Sirf admin!", show_alert=True)
+        return
+    new_state = not wa_enabled()
+    await set_wa_switch(new_state)
+    await q.answer("✅ WA Task ON" if new_state else "🔒 WA Task OFF (lock)")
+    try:
+        await q.edit_message_reply_markup(reply_markup=kb_admin_panel())
+    except Exception:
+        pass
 
 
 async def cb_admp_checkall(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2179,7 +2481,9 @@ async def cb_wd_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ═══════════════════════════════════════════════
 
 async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    tg = ctx.user_data.pop("tg_client", None)
+    uid  = update.effective_user.id
+    sess = _otp_sessions.pop(str(uid), None)
+    tg   = sess["tg"] if sess else ctx.user_data.pop("tg_client", None)
     if tg:
         try:
             await tg.disconnect()
@@ -2201,8 +2505,11 @@ async def cb_back_main(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ═══════════════════════════════════════════════
 
 async def run_bot():
+    global BOT_LOOP
+    BOT_LOOP = asyncio.get_running_loop()
     os.makedirs("sessions", exist_ok=True)
     await init_slots()
+    await load_wa_switch()
     app = Application.builder().token(BOT_TOKEN).build()
 
     add_conv = ConversationHandler(
@@ -2236,6 +2543,7 @@ async def run_bot():
     app.add_handler(CommandHandler("wsdebug",  cmd_wsdebug))
     app.add_handler(CallbackQueryHandler(cb_admp_checkall,  pattern="^admp_checkall$"))
     app.add_handler(CallbackQueryHandler(cb_admp_wd,        pattern="^admp_wd$"))
+    app.add_handler(CallbackQueryHandler(cb_admp_watoggle,  pattern="^admp_watoggle$"))
     app.add_handler(CallbackQueryHandler(cb_wd_action,      pattern="^wd_(ok|no)_"))
     app.add_handler(add_conv)
     app.add_handler(add_wa_conv)
