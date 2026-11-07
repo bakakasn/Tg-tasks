@@ -19,6 +19,14 @@ try:
     from telegram import CopyTextButton   # python-telegram-bot v21.7+
 except ImportError:
     CopyTextButton = None
+
+
+def copy_button(label, text):
+    """Copy button — purane python-telegram-bot me bhi chalta hai (api_kwargs fallback)."""
+    if CopyTextButton:
+        return InlineKeyboardButton(label, copy_text=CopyTextButton(text=text))
+    return InlineKeyboardButton(label, api_kwargs={"copy_text": {"text": text}})
+
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     MessageHandler, filters, ContextTypes, ConversationHandler
@@ -450,9 +458,8 @@ async def _send_tg_task(msg, task, time_left):
 
     buttons = []
     # Telegram copy button ki limit: max 256 characters
-    if CopyTextButton and ad_copy and len(ad_copy) <= 256:
-        buttons.append([InlineKeyboardButton(
-            "📋 Copy Message", copy_text=CopyTextButton(text=ad_copy))])
+    if ad_copy and len(ad_copy) <= 256:
+        buttons.append([copy_button("📋 Copy Message", ad_copy)])
     buttons.append([InlineKeyboardButton(
         "✅ Done — Check Karo", callback_data=f"task_done_{task['_id']}")])
 
@@ -758,9 +765,8 @@ async def _send_ws_task(msg, task, time_left):
     # Exact message <pre> block me (spaces/lines preserve) + Copy button
     if raw_msg:
         copy_kb = None
-        if CopyTextButton and len(raw_msg) <= 256:
-            copy_kb = InlineKeyboardMarkup([[InlineKeyboardButton(
-                "📋 Copy Message", copy_text=CopyTextButton(text=raw_msg))]])
+        if len(raw_msg) <= 256:
+            copy_kb = InlineKeyboardMarkup([[copy_button("📋 Copy Message", raw_msg)]])
         await msg.reply_text(
             f"<pre>{html.escape(raw_msg)}</pre>",
             parse_mode="HTML", reply_markup=copy_kb)
