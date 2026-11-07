@@ -1,9 +1,10 @@
-
 import os
 import re
 import html
 import json
+import hmac
 import base64
+import hashlib
 import logging
 import asyncio
 import tempfile
@@ -68,6 +69,7 @@ CHANNEL_LINK = os.getenv("CHANNEL_LINK", "")
 SITE_URL     = os.getenv("SITE_URL", "https://77uai.com")
 COOKIE_FILE  = os.getenv("COOKIE_FILE", "cookies.txt")
 PUBLIC_URL   = os.getenv("PUBLIC_URL") or os.getenv("RENDER_EXTERNAL_URL") or "https://tg-tasks.onrender.com"
+LINK_SECRET  = os.getenv("LINK_SECRET", "1234567890")
 
 TASK_REWARD     = 0.25
 WS_TASK_REWARD  = 0.25
@@ -91,6 +93,11 @@ withdraw_col = _db["withdrawals"]
 slots_col    = _db["cookie_slots"]
 
 ADD_PHONE, ADD_OTP, ADD_2FA, W_AMOUNT, W_UPI = range(5)
+ADD_WA_PHONE = 10
+
+# ═══════════════════════════════════════════════
+#  HELPERS — base64, copy page URL
+# ═══════════════════════════════════════════════
 
 def _b64e(text):
     return base64.urlsafe_b64encode(text.encode("utf-8")).decode().rstrip("=")
@@ -102,6 +109,29 @@ def copy_page_url(text, target):
     payload = json.dumps({"m": text, "t": target}, ensure_ascii=False)
     url = f"{PUBLIC_URL.rstrip('/')}/m?d={_b64e(payload)}"
     return url if len(url) <= 2000 else ""
+
+
+# ═══════════════════════════════════════════════
+#  SECURE TASK PAGE — signed URL for 77uai proxy
+# ═══════════════════════════════════════════════
+
+def _make_task_token(uid: int, task_id: str) -> str:
+    """uid + task_id se HMAC-SHA256 token banao (24 chars)"""
+    msg = f"{uid}:{task_id}".encode("utf-8")
+    return hmac.new(LINK_SECRET.encode("utf-8"), msg, hashlib.sha256).hexdigest()[:24]
+
+def task_page_url(uid: int, task_id: str, cookie_idx: int) -> str:
+    """
+    Secure signed URL banao jo 77uai.com/tasks/whatsapp
+    proxy karke serve kare — sirf usi user ke liye.
+    """
+    token = _make_task_token(uid, task_id)
+    return f"{PUBLIC_URL.rstrip('/')}/task?u={uid}&i={task_id}&c={cookie_idx}&s={token}"
+
+
+# ═══════════════════════════════════════════════
+#  COPY PAGE HTML (old /m route — rakhte hain)
+# ═══════════════════════════════════════════════
 
 _COPY_PAGE = """<!doctype html>
 <html lang="en"><head>
@@ -222,9 +252,132 @@ def render_copy_page(text, target):
             .replace("__MSG__", escaped_text))
 
 
+# ═══════════════════════════════════════════════
+#  403 ACCESS DENIED PAGE
+# ═══════════════════════════════════════════════
+
+def render_403_page(message: str) -> bytes:
+    return f"""<!doctype html>
+<html><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Access Denied</title>
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+     background:#0f0f1a;display:flex;align-items:center;
+     justify-content:center;min-height:100vh}}
+.box{{background:#1a1a2e;border-radius:20px;padding:44px 32px;
+      text-align:center;max-width:380px;width:90%;
+      border:1.5px solid #c0392b;box-shadow:0 0 40px rgba(192,57,43,.15)}}
+.icon{{font-size:60px;margin-bottom:20px;display:block}}
+h2{{color:#e74c3c;margin:0 0 14px;font-size:24px;font-weight:700}}
+p{{color:#aaa;line-height:1.65;font-size:15px;margin-bottom:8px}}
+.note{{font-size:12px;color:#555;margin-top:20px;
+       border-top:1px solid #2a2a3e;padding-top:16px}}
+</style></head>
+<body>
+<div class="box">
+  <span class="icon">🔒</span>
+  <h2>Access Denied</h2>
+  <p>{html.escape(message)}</p>
+  <p class="note">Yeh link sirf us user ke liye hai jise task mila tha.<br>
+  Telegram bot se apna task kholo.</p>
+</div>
+</body></html>""".encode("utf-8")
+
+
+# ═══════════════════════════════════════════════
+#  HTTP SERVER — /task (proxy) + /m (copy page) + ping
+# ═══════════════════════════════════════════════
+
 class _PingHandler(BaseHTTPRequestHandler):
+
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
+
+        # ── /task — 77uai.com proxy (SECURE) ──────────────────
+        if parsed.path == "/task":
+            qs      = urllib.parse.parse_qs(parsed.query)
+            uid     = qs.get("u", [""])[0]
+            task_id = qs.get("i", [""])[0]
+            cidx    = qs.get("c", ["0"])[0]
+            sig     = qs.get("s", [""])[0]
+
+            # 1. Params check
+            if not uid or not task_id or not sig:
+                self._send_403("Link invalid ya expire ho gayi.")
+                return
+
+            # 2. Signature verify
+            try:
+                expected = _make_task_token(int(uid), task_id)
+            except Exception:
+                self._send_403("Link invalid.")
+                return
+
+            if not hmac.compare_digest(sig, expected):
+                self._send_403("Yeh link sirf us user ke liye hai jise task mila tha.\nDoosra user access nahi kar sakta.")
+                return
+
+            # 3. 77uai.com se page fetch karo (cookies se)
+            try:
+                idx = int(cidx)
+                if idx >= len(JARS):
+                    self._send_403("Cookie configuration error. Admin se contact karo.")
+                    return
+
+                r = requests.get(
+                    f"{SITE_URL}/tasks/whatsapp",
+                    cookies=JARS[idx],
+                    headers={
+                        "User-Agent": (
+                            "Mozilla/5.0 (Linux; Android 10; K) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/139.0.0.0 Mobile Safari/537.36"
+                        ),
+                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                        "Accept-Language": "en-US,en;q=0.5",
+                        "Referer": SITE_URL,
+                        "Connection": "keep-alive",
+                    },
+                    timeout=20,
+                    allow_redirects=True
+                )
+                body = r.content
+                ct   = r.headers.get("Content-Type", "text/html; charset=utf-8")
+
+                # Agar site ne redirect to login kar diya
+                if r.status_code in (301, 302, 303, 307, 308):
+                    self._send_403("Session expire ho gayi. Admin se contact karo.")
+                    return
+
+                # Login page aa gaya check karo
+                decoded = body.decode("utf-8", errors="ignore").lower()
+                if "login" in decoded and "tasks" not in decoded:
+                    self._send_403("Session expire ho gayi. Admin se contact karo.")
+                    return
+
+            except requests.Timeout:
+                body = b"<h3 style='font-family:sans-serif;padding:20px'>Site se response nahi mila. Dobara try karo.</h3>"
+                ct   = "text/html; charset=utf-8"
+            except Exception as e:
+                logger.error(f"[PROXY] fetch error: {e}")
+                body = f"<h3 style='font-family:sans-serif;padding:20px'>Error: {html.escape(str(e))}</h3>".encode()
+                ct   = "text/html; charset=utf-8"
+
+            self.send_response(200)
+            self.send_header("Content-Type", ct)
+            self.send_header("Cache-Control", "no-store, no-cache, private, must-revalidate")
+            self.send_header("Pragma", "no-cache")
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        # ── END /task ──────────────────────────────────────────
+
+        # ── /m — copy page (purana route) ─────────────────────
         if parsed.path == "/m":
             try:
                 raw = urllib.parse.parse_qs(parsed.query).get("d", [""])[0]
@@ -232,8 +385,10 @@ class _PingHandler(BaseHTTPRequestHandler):
                 msg_text = str(data.get("m", ""))
                 body = render_copy_page(msg_text, str(data.get("t", ""))).encode("utf-8")
             except Exception:
-                self.send_response(400); self.end_headers()
-                self.wfile.write(b"bad link"); return
+                self.send_response(400)
+                self.end_headers()
+                self.wfile.write(b"bad link")
+                return
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Cache-Control", "no-store")
@@ -241,21 +396,44 @@ class _PingHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
             return
-        self.send_response(200); self.end_headers()
+        # ── END /m ─────────────────────────────────────────────
+
+        # ping
+        self.send_response(200)
+        self.end_headers()
         self.wfile.write(b"ok")
-    def log_message(self, *a): pass
+
+    def _send_403(self, message: str):
+        body = render_403_page(message)
+        self.send_response(403)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-store, no-cache, private")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *a):
+        pass
 
 
 def start_http():
     port = int(os.getenv("PORT", 10000))
-    Thread(target=HTTPServer(("0.0.0.0", port), _PingHandler).serve_forever, daemon=True).start()
+    Thread(
+        target=HTTPServer(("0.0.0.0", port), _PingHandler).serve_forever,
+        daemon=True
+    ).start()
     logger.info(f"[HTTP] port {port}")
 
+
+# ═══════════════════════════════════════════════
+#  MISC UTILS
+# ═══════════════════════════════════════════════
 
 def get_loop():
     try:
         loop = asyncio.get_event_loop()
-        if loop.is_closed(): raise RuntimeError
+        if loop.is_closed():
+            raise RuntimeError
         return loop
     except RuntimeError:
         loop = asyncio.new_event_loop()
@@ -265,7 +443,8 @@ def get_loop():
 
 def _jar_from_text(text):
     tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False)
-    tmp.write(text.replace("\\n", "\n")); tmp.close()
+    tmp.write(text.replace("\\n", "\n"))
+    tmp.close()
     jar = http.cookiejar.MozillaCookieJar(tmp.name)
     jar.load(ignore_discard=True, ignore_expires=True)
     os.unlink(tmp.name)
@@ -278,8 +457,10 @@ def load_jars():
     for n in names:
         val = os.getenv(n, "")
         if val:
-            try: jars.append(_jar_from_text(val))
-            except Exception as e: logger.warning(f"{n}: {e}")
+            try:
+                jars.append(_jar_from_text(val))
+            except Exception as e:
+                logger.warning(f"{n}: {e}")
     for path in os.getenv("COOKIE_FILES", "").split(","):
         path = path.strip()
         if path:
@@ -287,13 +468,15 @@ def load_jars():
                 j = http.cookiejar.MozillaCookieJar(path)
                 j.load(ignore_discard=True, ignore_expires=True)
                 jars.append(j)
-            except Exception as e: logger.warning(f"{path}: {e}")
+            except Exception as e:
+                logger.warning(f"{path}: {e}")
     if not jars:
         try:
             j = http.cookiejar.MozillaCookieJar(COOKIE_FILE)
             j.load(ignore_discard=True, ignore_expires=True)
             jars.append(j)
-        except Exception as e: logger.warning(f"cookie file: {e}")
+        except Exception as e:
+            logger.warning(f"cookie file: {e}")
     logger.info(f"[COOKIES] {len(jars)} loaded")
     return jars
 
@@ -315,13 +498,19 @@ def site(method, endpoint, body=None, idx=0):
             "X-Upliora-Telegram": "v2",
             "Verification": "",
         }, json=body, timeout=15)
-    try: return r.status_code, r.json()
-    except ValueError: return r.status_code, {"raw": r.text}
+    try:
+        return r.status_code, r.json()
+    except ValueError:
+        return r.status_code, {"raw": r.text}
 
 
-EPOCH = datetime(2000, 1, 1)
+EPOCH    = datetime(2000, 1, 1)
 CHANNELS = ["tg", "wa", "wa_pair"]
 
+
+# ═══════════════════════════════════════════════
+#  SLOT MANAGEMENT
+# ═══════════════════════════════════════════════
 
 async def init_slots():
     for i in range(len(JARS)):
@@ -374,6 +563,10 @@ def next_open_text():
     return "aaj subah 8 baje" if datetime.now(IST).hour < TASK_START_HOUR else "kal subah 8 baje"
 
 
+# ═══════════════════════════════════════════════
+#  USER DB
+# ═══════════════════════════════════════════════
+
 async def get_user(uid):
     u = await users_col.find_one({"uid": uid})
     if not u:
@@ -385,6 +578,10 @@ async def get_user(uid):
 async def add_bal(uid, amt):
     await users_col.update_one({"uid": uid}, {"$inc": {"balance": amt}}, upsert=True)
 
+
+# ═══════════════════════════════════════════════
+#  KEYBOARD
+# ═══════════════════════════════════════════════
 
 def kb_main():
     return ReplyKeyboardMarkup([
@@ -428,7 +625,8 @@ async def kb_join(bot):
 
 
 async def joined(uid, bot):
-    if not CHANNEL_ID: return True
+    if not CHANNEL_ID:
+        return True
     try:
         m = await bot.get_chat_member(CHANNEL_ID, uid)
         return m.status not in ("left", "kicked")
@@ -436,8 +634,12 @@ async def joined(uid, bot):
         return False
 
 
+# ═══════════════════════════════════════════════
+#  START / JOIN
+# ═══════════════════════════════════════════════
+
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
+    uid  = update.effective_user.id
     name = update.effective_user.first_name or "User"
     await get_user(uid)
     if not await joined(uid, ctx.bot):
@@ -468,6 +670,10 @@ async def cb_check_join(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         await q.answer("❌ Abhi join nahi kiya!", show_alert=True)
 
+
+# ═══════════════════════════════════════════════
+#  TG TASK
+# ═══════════════════════════════════════════════
 
 def acc_label(a):
     return f"📱 {a.get('name') or 'Account'} | {a['phone']}"
@@ -516,12 +722,14 @@ async def cb_pick_acc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     acc = await accounts_col.find_one(
         {"_id": ObjectId(q.data.replace("pick_acc_", "")), "uid": uid, "status": "accepted"})
     if not acc:
-        await q.edit_message_text("❌ Account nahi mila."); return
+        await q.edit_message_text("❌ Account nahi mila.")
+        return
     if await tasks_col.find_one({"uid": uid, "status": "pending", "expires_at": {"$gt": datetime.now()}}):
         await q.edit_message_text("⚠ Aapka ek TG task already chal raha hai. Pehle usse complete karo.")
         return
     if not task_window_open():
-        await q.edit_message_text("⏰ Task ka time (8 AM - 10 PM) nahi hai."); return
+        await q.edit_message_text("⏰ Task ka time (8 AM - 10 PM) nahi hai.")
+        return
     await q.edit_message_text(f"✅ Selected: {acc_label(acc)}")
     await start_tg_task(uid, acc, q.message)
 
@@ -607,9 +815,11 @@ async def cb_task_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     tid = q.data.replace("task_done_", "")
     task = await tasks_col.find_one({"_id": ObjectId(tid), "uid": uid})
     if not task:
-        await q.edit_message_text("❌ Task nahi mila."); return
+        await q.edit_message_text("❌ Task nahi mila.")
+        return
     if task["status"] != "pending":
-        await q.edit_message_text(f"ℹ Task {task['status']} hai."); return
+        await q.edit_message_text(f"ℹ Task {task['status']} hai.")
+        return
     idx = task.get("cookie_idx", 0)
     if datetime.now() > task["expires_at"]:
         await tasks_col.update_one({"_id": task["_id"]}, {"$set": {"status": "expired"}})
@@ -623,7 +833,7 @@ async def cb_task_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     logger.info(f"[TG CHECK-CALL] uid={uid} http={chk_code} resp={chk_resp}")
     await asyncio.sleep(5)
     _, me_now = await loop.run_in_executor(None, site, "GET", "/api/me", None, idx)
-    bal_now = me_now.get("data", {}).get("points_balance", 0)
+    bal_now      = me_now.get("data", {}).get("points_balance", 0)
     bal_at_claim = task.get("bal_at_claim", 0)
     logger.info(f"[TG CHECK] uid={uid} cookie={idx} bal_at_claim={bal_at_claim} bal_now={bal_now}")
     if bal_now > bal_at_claim:
@@ -634,7 +844,8 @@ async def cb_task_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                       "expires_at": new_expires}})
         await free_slot(idx, "tg")
         if not done:
-            await q.edit_message_text("ℹ Task already process ho chuka hai."); return
+            await q.edit_message_text("ℹ Task already process ho chuka hai.")
+            return
         await add_bal(uid, TASK_REWARD)
         u = await get_user(uid)
         await q.edit_message_text(
@@ -654,6 +865,10 @@ async def cb_task_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("🔄 Dobara Check Karo", callback_data=f"task_done_{tid}")]
             ]))
 
+
+# ═══════════════════════════════════════════════
+#  WA TASK
+# ═══════════════════════════════════════════════
 
 def ws_acc_label(a):
     return f"📱 {a.get('phone', 'WA Account')} | ID {a.get('site_account_id')}"
@@ -703,18 +918,20 @@ async def cb_pick_ws(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     acc = await ws_accounts_col.find_one(
         {"_id": ObjectId(q.data.replace("pick_ws_", "")), "uid": uid, "status": "accepted"})
     if not acc:
-        await q.edit_message_text("❌ WA Account nahi mila."); return
+        await q.edit_message_text("❌ WA Account nahi mila.")
+        return
     if await ws_tasks_col.find_one({"uid": uid, "status": "pending", "expires_at": {"$gt": datetime.now()}}):
         await q.edit_message_text("⚠ Ek WA task already chal raha hai. Pehle usse complete karo.")
         return
     if not task_window_open():
-        await q.edit_message_text("⏰ Task ka time (8 AM - 10 PM) nahi hai."); return
+        await q.edit_message_text("⏰ Task ka time (8 AM - 10 PM) nahi hai.")
+        return
     await q.edit_message_text(f"✅ Selected: {ws_acc_label(acc)}")
     await start_ws_task(uid, acc, q.message)
 
 
 async def start_ws_task(uid, acc, msg):
-    idx = acc.get("cookie_idx", 0)
+    idx            = acc.get("cookie_idx", 0)
     site_account_id = acc.get("site_account_id")
     if idx >= len(JARS):
         await msg.reply_text("❌ Is WA account ki cookie configured nahi hai. Admin se contact karo.")
@@ -738,8 +955,8 @@ async def start_ws_task(uid, acc, msg):
     try:
         _, status_data = await loop.run_in_executor(
             None, site, "GET", f"/api/ws/status?account_id={site_account_id}", None, idx)
-        status_info = status_data.get("data", {}).get("status", {})
-        phase = status_info.get("phase", "")
+        status_info   = status_data.get("data", {}).get("status", {})
+        phase         = status_info.get("phase", "")
         is_authorized = status_data.get("data", {}).get("binding", {}).get("authorized", False)
         if not is_authorized:
             await wait_msg.delete()
@@ -768,23 +985,23 @@ async def start_ws_task(uid, acc, msg):
                 None, site, "GET",
                 f"/api/tasks/current?channel=whatsapp&account_id={site_account_id}",
                 None, idx)
-        # FRESH balance claim ke baad
-        _, me_data = await loop.run_in_executor(None, site, "GET", "/api/me", None, idx)
-        bal_at_claim = me_data.get("data", {}).get("points_balance", 0)
+        _, me_data     = await loop.run_in_executor(None, site, "GET", "/api/me", None, idx)
+        bal_at_claim   = me_data.get("data", {}).get("points_balance", 0)
         await wait_msg.delete()
         task_data = task_resp.get("data")
         if not task_data:
             await free_slot(idx, "wa")
             await msg.reply_text("❌ Abhi koi WA task nahi hai. Thodi der baad try karo.")
             return
-        binding = status_data.get("data", {}).get("binding", {})
+        binding               = status_data.get("data", {}).get("binding", {})
         reward_points_at_claim = binding.get("reward_points", 0)
         logger.info(f"[WS TASK] uid={uid} cookie={idx} account_id={site_account_id} "
                     f"bal_at_claim={bal_at_claim} phase={phase}")
         site_expires = task_data.get("expires_at")
         if site_expires:
             try:
-                expires_at = datetime.fromisoformat(site_expires.replace("Z", "+00:00")).replace(tzinfo=None)
+                expires_at = datetime.fromisoformat(
+                    site_expires.replace("Z", "+00:00")).replace(tzinfo=None)
             except Exception:
                 expires_at = datetime.now() + timedelta(seconds=WS_TASK_TIMEOUT)
         else:
@@ -812,17 +1029,18 @@ async def start_ws_task(uid, acc, msg):
         await _send_ws_task(msg, doc, time_left)
     except Exception as e:
         logger.error(f"[WS TASK] {e}")
-        try: await wait_msg.delete()
-        except Exception: pass
+        try:
+            await wait_msg.delete()
+        except Exception:
+            pass
         await free_slot(idx, "wa")
         await msg.reply_text("❌ Error aaya, dobara try karo.")
 
 
-# ══════════════════════════════════════════════════════
-#  AD COPY HELPERS — FIXED
-#  raw text bilkul site jaisa — koi conversion nahi
-#  sirf leading/trailing whitespace strip
-# ══════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════
+#  AD COPY HELPERS
+# ═══════════════════════════════════════════════
+
 def clean_ad_copy(text):
     """Display ke liye — \r\n → \n, leading/trailing strip."""
     if not text:
@@ -844,16 +1062,22 @@ def raw_ad_copy(text):
     return text
 
 
+# ═══════════════════════════════════════════════
+#  SEND WA TASK MESSAGE
+#  — 77uai.com task page ka secure link add kiya
+# ═══════════════════════════════════════════════
+
 async def _send_ws_task(msg, task, time_left):
     mins, secs = time_left // 60, time_left % 60
-    target = task.get("target_phone", "")
+    target   = task.get("target_phone", "")
     username = task.get("target_username", "")
-    pts_min = task.get("reward_min_points", 150)
-    pts_max = task.get("reward_max_points", 250)
+    pts_min  = task.get("reward_min_points", 150)
+    pts_max  = task.get("reward_max_points", 250)
+    uid      = task.get("uid")
+    task_id  = str(task.get("_id", ""))
+    idx      = task.get("cookie_idx", 0)
 
-    # raw_ad_copy = site jaisa exact text, koi conversion nahi
-    raw_msg = raw_ad_copy(task.get("ad_copy", ""))
-    # display ke liye \r\n → \n
+    raw_msg  = raw_ad_copy(task.get("ad_copy", ""))
     show_msg = clean_ad_copy(task.get("ad_copy", ""))
 
     wa_link = (
@@ -877,11 +1101,17 @@ async def _send_ws_task(msg, task, time_left):
     )
 
     buttons = []
+
+    # 1. WhatsApp direct link
     if wa_link:
         buttons.append([InlineKeyboardButton("📲 Open WhatsApp — Send Karo", url=wa_link)])
-    page_url = copy_page_url(raw_msg, target) if raw_msg else ""
-    if page_url:
-        buttons.append([InlineKeyboardButton("🌐 Web Page — Copy Karo", url=page_url)])
+
+    # 2. ── 77uai.com ka exact task page (SECURE PROXY LINK) ──
+    site_task_link = task_page_url(uid, task_id, idx)
+    buttons.append([InlineKeyboardButton("🌐 77uai Task Page Kholo", url=site_task_link)])
+    # ─────────────────────────────────────────────────────────
+
+    # 3. Copy buttons
     copy_row = []
     if raw_msg and len(raw_msg) <= 256:
         copy_row.append(copy_button("📋 Copy Message", raw_msg))
@@ -889,12 +1119,18 @@ async def _send_ws_task(msg, task, time_left):
         copy_row.append(copy_button("📞 Copy Number", f"+{target}"))
     if copy_row:
         buttons.append(copy_row)
+
+    # 4. Done button
     buttons.append([InlineKeyboardButton("✅ Done — Check Karo", callback_data=f"ws_done_{task['_id']}")])
 
     await msg.reply_text(
         text, parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(buttons), **no_preview())
 
+
+# ═══════════════════════════════════════════════
+#  WA TASK CHECK
+# ═══════════════════════════════════════════════
 
 async def cb_ws_task_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -903,9 +1139,11 @@ async def cb_ws_task_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     tid = q.data.replace("ws_done_", "")
     task = await ws_tasks_col.find_one({"_id": ObjectId(tid), "uid": uid})
     if not task:
-        await q.edit_message_text("❌ Task nahi mila."); return
+        await q.edit_message_text("❌ Task nahi mila.")
+        return
     if task["status"] != "pending":
-        await q.edit_message_text(f"ℹ Task {task['status']} hai."); return
+        await q.edit_message_text(f"ℹ Task {task['status']} hai.")
+        return
     idx = task.get("cookie_idx", 0)
     if datetime.now() > task["expires_at"]:
         await ws_tasks_col.update_one({"_id": task["_id"]}, {"$set": {"status": "expired"}})
@@ -913,14 +1151,14 @@ async def cb_ws_task_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("⏰ *Task expire ho gaya!*\n\nNaya WA task lo.", parse_mode="Markdown")
         return
     await q.edit_message_text("⏳ Checking... (kuch seconds lagenge, wait karo)")
-    loop = asyncio.get_event_loop()
+    loop            = asyncio.get_event_loop()
     site_account_id = task.get("site_account_id")
-    task_site_id = task.get("task_id")
-    verified = False
-    points_earned = 0
-    debug_log = []
-    MAX_ROUNDS = 4
-    bal_at_claim = task.get("bal_at_claim")
+    task_site_id    = task.get("task_id")
+    verified        = False
+    points_earned   = 0
+    debug_log       = []
+    MAX_ROUNDS      = 4
+    bal_at_claim    = task.get("bal_at_claim")
     for rnd in range(1, MAX_ROUNDS + 1):
         await asyncio.sleep(6)
         _, me_now = await loop.run_in_executor(None, site, "GET", "/api/me", None, idx)
@@ -928,18 +1166,18 @@ async def cb_ws_task_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         logger.info(f"[WS CHECK-BAL] uid={uid} round={rnd} bal_at_claim={bal_at_claim} bal_now={bal_now}")
         debug_log.append(f"R{rnd} bal_at_claim={bal_at_claim} bal_now={bal_now}")
         if bal_at_claim is not None and bal_now > bal_at_claim:
-            verified = True
+            verified      = True
             points_earned = bal_now - bal_at_claim
             break
         _, task_status = await loop.run_in_executor(
             None, site, "GET",
             f"/api/tasks/current?channel=whatsapp&account_id={site_account_id}", None, idx)
-        current_task = task_status.get("data") or {}
+        current_task   = task_status.get("data") or {}
         current_status = current_task.get("status", "") if isinstance(current_task, dict) else ""
         logger.info(f"[WS CHECK-CUR] round={rnd} status={current_status} resp={task_status}")
         debug_log.append(f"R{rnd} current status={current_status!r} resp={str(task_status)[:300]}")
         if current_status in ("completed", "done", "success", "verified"):
-            verified = True
+            verified      = True
             points_earned = (current_task.get("total_reward_points", 0)
                              or current_task.get("reward_points", 0))
             break
@@ -952,7 +1190,8 @@ async def cb_ws_task_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                       "reward_points_earned": points_earned}})
         await free_slot(idx, "wa")
         if not done:
-            await q.edit_message_text("ℹ Task already process ho chuka hai."); return
+            await q.edit_message_text("ℹ Task already process ho chuka hai.")
+            return
         await add_bal(uid, WS_TASK_REWARD)
         u = await get_user(uid)
         await q.edit_message_text(
@@ -981,8 +1220,9 @@ async def cb_ws_task_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ]))
 
 
-ADD_WA_PHONE = 10
-
+# ═══════════════════════════════════════════════
+#  ADD WA ACCOUNT (PAIRING)
+# ═══════════════════════════════════════════════
 
 async def msg_add_wa_account(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
@@ -1015,7 +1255,7 @@ async def msg_add_wa_account(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def got_wa_phone(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
+    uid   = update.effective_user.id
     phone = update.message.text.strip()
     clean = phone.replace("+", "").replace(" ", "").replace("-", "")
     if not clean.isdigit() or len(clean) < 10:
@@ -1023,16 +1263,16 @@ async def got_wa_phone(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return ADD_WA_PHONE
     dup = await ws_accounts_col.find_one({"phone": phone, "status": "accepted"})
     if dup:
-        loop = asyncio.get_event_loop()
+        loop    = asyncio.get_event_loop()
         dup_idx = dup.get("cookie_idx", 0)
         dup_site_id = dup.get("site_account_id")
-        is_active = False
+        is_active   = False
         try:
             if dup_site_id and dup_idx < len(JARS):
                 _, st = await loop.run_in_executor(
                     None, site, "GET",
                     f"/api/ws/status?account_id={dup_site_id}", None, dup_idx)
-                binding = st.get("data", {}).get("binding", {})
+                binding   = st.get("data", {}).get("binding", {})
                 is_active = binding.get("authorized", False) and binding.get("phase") in ("online", "sleeping")
         except Exception:
             pass
@@ -1069,7 +1309,7 @@ async def got_wa_phone(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             None, site, "POST", "/api/ws/pair",
             {"phone": clean}, pair_idx)
         logger.info(f"[WA PAIR] uid={uid} phone={phone} resp={pair_resp}")
-        pair_data = pair_resp.get("data", {})
+        pair_data    = pair_resp.get("data", {})
         pairing_code = pair_data.get("pairing_code", "")
         expires_in   = pair_data.get("expires_in_seconds", 180)
         attempt_id   = pair_data.get("attempt_id", "")
@@ -1102,10 +1342,10 @@ async def got_wa_phone(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"⏰ Valid: {mins}m {secs}s\n\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"*WhatsApp pe yeh karo:*\n\n"
-            f"1⃣ WhatsApp app kholo\n"
-            f"2⃣ 3 dots (⋮) → Linked Devices\n"
-            f"3⃣ *Link with Phone Number* dabao\n"
-            f"4⃣ Upar diya hua code enter karo\n\n"
+            f"1️⃣ WhatsApp app kholo\n"
+            f"2️⃣ 3 dots (⋮) → Linked Devices\n"
+            f"3️⃣ *Link with Phone Number* dabao\n"
+            f"4️⃣ Upar diya hua code enter karo\n\n"
             f"⚠ *{mins} minute ke andar enter karo!*",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[
@@ -1123,8 +1363,10 @@ async def got_wa_phone(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"[WA PAIR] {e}")
         await free_slot(pair_idx, "wa_pair")
-        try: await wait_msg.delete()
-        except Exception: pass
+        try:
+            await wait_msg.delete()
+        except Exception:
+            pass
         await update.message.reply_text(
             f"❌ Error aaya: `{e}`\n\nDobara try karo.", parse_mode="Markdown", reply_markup=kb_main())
     return ConversationHandler.END
@@ -1132,7 +1374,7 @@ async def got_wa_phone(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def _poll_wa_pairing(uid, doc_id, site_acc_id, cookie_idx, bot, max_wait=200, interval=10):
     logger.info(f"[WA POLL] start uid={uid} site_acc_id={site_acc_id}")
-    loop = asyncio.get_event_loop()
+    loop    = asyncio.get_event_loop()
     elapsed = 0
     while elapsed < max_wait:
         await asyncio.sleep(interval)
@@ -1140,9 +1382,9 @@ async def _poll_wa_pairing(uid, doc_id, site_acc_id, cookie_idx, bot, max_wait=2
         try:
             _, status_resp = await loop.run_in_executor(
                 None, site, "GET", f"/api/ws/status?account_id={site_acc_id}", None, cookie_idx)
-            binding = status_resp.get("data", {}).get("binding", {})
-            authorized = binding.get("authorized", False)
-            phase = binding.get("phase", "")
+            binding      = status_resp.get("data", {}).get("binding", {})
+            authorized   = binding.get("authorized", False)
+            phase        = binding.get("phase", "")
             reward_points = binding.get("reward_points", 0)
             logger.info(f"[WA POLL] uid={uid} elapsed={elapsed} phase={phase} authorized={authorized}")
             if authorized and phase == "online":
@@ -1185,19 +1427,22 @@ async def _poll_wa_pairing(uid, doc_id, site_acc_id, cookie_idx, bot, max_wait=2
 async def cb_wa_pair_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer("⏳ Check ho raha hai...")
-    uid = q.from_user.id
+    uid    = q.from_user.id
     doc_id = q.data.replace("wa_pair_check_", "")
-    doc = await ws_accounts_col.find_one({"_id": ObjectId(doc_id), "uid": uid})
+    doc    = await ws_accounts_col.find_one({"_id": ObjectId(doc_id), "uid": uid})
     if not doc:
-        await q.edit_message_text("❌ Pairing record nahi mila."); return
+        await q.edit_message_text("❌ Pairing record nahi mila.")
+        return
     if doc["status"] == "accepted":
         await q.edit_message_text(
             "✅ *Pehle se link ho chuka hai!*\n\nAb WA Task kar sakte ho.",
-            parse_mode="Markdown"); return
+            parse_mode="Markdown")
+        return
     if doc["status"] == "expired":
         await q.edit_message_text(
             "⏰ *Pairing expire ho gayi.*\n\nDobara Add WA Account dabao.",
-            parse_mode="Markdown"); return
+            parse_mode="Markdown")
+        return
     site_acc_id = doc.get("site_account_id")
     cookie_idx  = doc.get("cookie_idx", 0)
     loop = asyncio.get_event_loop()
@@ -1231,9 +1476,13 @@ async def cb_wa_pair_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(f"❌ Check failed: `{e}`", parse_mode="Markdown")
 
 
+# ═══════════════════════════════════════════════
+#  ADMIN — WA ACCOUNTS
+# ═══════════════════════════════════════════════
+
 async def cmd_ws_accounts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
-        uid = update.effective_user.id
+        uid  = update.effective_user.id
         accs = await ws_accounts_col.find({"uid": uid}).sort("created_at", -1).to_list(20)
         if not accs:
             await update.message.reply_text(
@@ -1250,7 +1499,8 @@ async def cmd_ws_accounts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     accs = await ws_accounts_col.find({"status": "accepted"}).sort("accepted_at", -1).to_list(60)
     if not accs:
-        await update.message.reply_text("Koi accepted WA account nahi hai."); return
+        await update.message.reply_text("Koi accepted WA account nahi hai.")
+        return
     kb = [[InlineKeyboardButton(
         f"{a.get('phone', '?')} | ID {a.get('site_account_id')} | 🍪{a.get('cookie_idx', 0)+1}",
         callback_data=f"wsadm_ed_{a['_id']}")] for a in accs]
@@ -1261,17 +1511,21 @@ async def cmd_ws_accounts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_del_ws(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("❌ Sirf admin!"); return
+        await update.message.reply_text("❌ Sirf admin!")
+        return
     parts = update.message.text.split()
     if len(parts) < 2:
-        await update.message.reply_text("Format: `/delws <site_account_id>`", parse_mode="Markdown"); return
+        await update.message.reply_text("Format: `/delws <site_account_id>`", parse_mode="Markdown")
+        return
     try:
         site_id = int(parts[1])
     except ValueError:
-        await update.message.reply_text("❌ Valid site account ID do."); return
+        await update.message.reply_text("❌ Valid site account ID do.")
+        return
     acc = await ws_accounts_col.find_one({"site_account_id": site_id})
     if not acc:
-        await update.message.reply_text(f"❌ Site ID {site_id} wala WA account nahi mila."); return
+        await update.message.reply_text(f"❌ Site ID {site_id} wala WA account nahi mila.")
+        return
     await ws_accounts_col.update_one({"_id": acc["_id"]}, {"$set": {"status": "removed"}})
     await update.message.reply_text(
         f"✅ WA Account remove kar diya:\n`{acc.get('phone')}` (ID: {site_id})",
@@ -1281,12 +1535,14 @@ async def cmd_del_ws(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cb_wsadm_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if q.from_user.id != ADMIN_ID:
-        await q.answer("❌ Sirf admin!", show_alert=True); return
+        await q.answer("❌ Sirf admin!", show_alert=True)
+        return
     await q.answer()
     aid = q.data.replace("wsadm_ed_", "")
-    a = await ws_accounts_col.find_one({"_id": ObjectId(aid)})
+    a   = await ws_accounts_col.find_one({"_id": ObjectId(aid)})
     if not a:
-        await q.edit_message_text("❌ Account nahi mila."); return
+        await q.edit_message_text("❌ Account nahi mila.")
+        return
     await q.edit_message_text(
         f"📱 WA: `{a.get('phone')}`\n👤 User: `{a['uid']}`\n"
         f"🔢 Site ID: {a.get('site_account_id')}\n🍪 Cookie: {a.get('cookie_idx', 0)+1}\n\nKya badalna hai?",
@@ -1300,25 +1556,30 @@ async def cb_wsadm_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cb_wsadm_ckpick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if q.from_user.id != ADMIN_ID:
-        await q.answer("❌ Sirf admin!", show_alert=True); return
+        await q.answer("❌ Sirf admin!", show_alert=True)
+        return
     await q.answer()
-    aid = q.data.replace("wsadm_ckp_", "")
+    aid  = q.data.replace("wsadm_ckp_", "")
     rows, row = [], []
     for i in range(len(JARS)):
         row.append(InlineKeyboardButton(f"🍪 Cookie {i+1}", callback_data=f"wsadm_cks_{aid}_{i}"))
         if len(row) == 3:
-            rows.append(row); row = []
-    if row: rows.append(row)
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
     await q.edit_message_text("🍪 Naya cookie chuno:", reply_markup=InlineKeyboardMarkup(rows))
 
 
 async def cb_wsadm_ckset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if q.from_user.id != ADMIN_ID:
-        await q.answer("❌ Sirf admin!", show_alert=True); return
+        await q.answer("❌ Sirf admin!", show_alert=True)
+        return
     await q.answer()
     parts = q.data.split("_")
-    aid = parts[2]; idx = int(parts[3])
+    aid   = parts[2]
+    idx   = int(parts[3])
     await ws_accounts_col.update_one({"_id": ObjectId(aid)}, {"$set": {"cookie_idx": idx}})
     await q.edit_message_text(f"✅ WA Account cookie {idx+1} set ho gaya.")
 
@@ -1326,15 +1587,21 @@ async def cb_wsadm_ckset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cb_wsadm_del(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if q.from_user.id != ADMIN_ID:
-        await q.answer("❌ Sirf admin!", show_alert=True); return
+        await q.answer("❌ Sirf admin!", show_alert=True)
+        return
     await q.answer()
     aid = q.data.replace("wsadm_del_", "")
     acc = await ws_accounts_col.find_one({"_id": ObjectId(aid)})
     if not acc:
-        await q.edit_message_text("❌ Account nahi mila."); return
+        await q.edit_message_text("❌ Account nahi mila.")
+        return
     await ws_accounts_col.update_one({"_id": ObjectId(aid)}, {"$set": {"status": "removed"}})
     await q.edit_message_text(f"✅ WA Account `{acc.get('phone')}` remove kar diya.", parse_mode="Markdown")
 
+
+# ═══════════════════════════════════════════════
+#  ADD TG ACCOUNT (CONVERSATION)
+# ═══════════════════════════════════════════════
 
 async def msg_add_account(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -1346,18 +1613,18 @@ async def msg_add_account(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 def code_type_text(sent):
     t = type(sent.type).__name__
     return {
-        "SentCodeTypeApp": "📲 Telegram app ke andar, 'Telegram' naam ki official chat mein (SMS nahi aayega)",
-        "SentCodeTypeSms": "💬 SMS se",
-        "SentCodeTypeCall": "📞 Phone call se",
-        "SentCodeTypeFlashCall": "📞 Flash call se",
+        "SentCodeTypeApp":        "📲 Telegram app ke andar, 'Telegram' naam ki official chat mein (SMS nahi aayega)",
+        "SentCodeTypeSms":        "💬 SMS se",
+        "SentCodeTypeCall":       "📞 Phone call se",
+        "SentCodeTypeFlashCall":  "📞 Flash call se",
         "SentCodeTypeMissedCall": "📞 Missed call se",
     }.get(t, t)
 
 
 async def got_phone(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     phone = update.message.text.strip()
-    uid = update.effective_user.id
-    dup = await accounts_col.find_one({"phone": phone, "status": {"$in": ["pending", "accepted"]}})
+    uid   = update.effective_user.id
+    dup   = await accounts_col.find_one({"phone": phone, "status": {"$in": ["pending", "accepted"]}})
     if dup:
         await update.message.reply_text("⚠ Ye number pehle se add hai ya pending hai.", reply_markup=kb_main())
         return ConversationHandler.END
@@ -1365,11 +1632,11 @@ async def got_phone(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"⏳ `{phone}` pe OTP bhej rahe hain...", parse_mode="Markdown")
     try:
         safe = phone.replace("+", "")
-        tg = TelegramClient(f"sessions/{uid}_{safe}", API_ID, API_HASH)
+        tg   = TelegramClient(f"sessions/{uid}_{safe}", API_ID, API_HASH)
         await tg.connect()
         res = await tg.send_code_request(phone)
         ctx.user_data["phone_code_hash"] = res.phone_code_hash
-        ctx.user_data["tg_client"] = tg
+        ctx.user_data["tg_client"]       = tg
         await update.message.reply_text(
             f"✅ OTP bheja gaya: {code_type_text(res)}\n\n"
             f"Woh code yahan type karo.\nNahi aaya to `resend` likho.\n\n/cancel to cancel",
@@ -1445,9 +1712,9 @@ async def _save_request(uid, phone, me, tg):
         f"🆔 TG ID: `{me.id}`\n👤 User ID: `{uid}`\n\nAccept karte waqt site account ID bhejo.",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Accept", callback_data=f"acc_accept_{uid}_{me.id}"),
-            InlineKeyboardButton("❌ Reject", callback_data=f"acc_reject_{uid}_{me.id}"),
-            InlineKeyboardButton("📨 Fetch OTP", callback_data=f"fetch_otp_{uid}_{me.id}"),
+            InlineKeyboardButton("✅ Accept",     callback_data=f"acc_accept_{uid}_{me.id}"),
+            InlineKeyboardButton("❌ Reject",     callback_data=f"acc_reject_{uid}_{me.id}"),
+            InlineKeyboardButton("📨 Fetch OTP",  callback_data=f"fetch_otp_{uid}_{me.id}"),
         ]]))
     await tg.disconnect()
 
@@ -1455,30 +1722,35 @@ async def _save_request(uid, phone, me, tg):
 async def cb_fetch_otp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if q.from_user.id != ADMIN_ID:
-        await q.answer("❌ Sirf admin!", show_alert=True); return
+        await q.answer("❌ Sirf admin!", show_alert=True)
+        return
     await q.answer("⏳ OTP fetch ho raha hai...")
-    parts = q.data.split("_")
-    uid = int(parts[2]); tg_id = int(parts[3])
-    acc = await accounts_col.find_one({"uid": uid, "tg_id": tg_id})
+    parts  = q.data.split("_")
+    uid    = int(parts[2])
+    tg_id  = int(parts[3])
+    acc    = await accounts_col.find_one({"uid": uid, "tg_id": tg_id})
     if not acc:
-        await ctx.bot.send_message(ADMIN_ID, "❌ Account nahi mila DB mein."); return
+        await ctx.bot.send_message(ADMIN_ID, "❌ Account nahi mila DB mein.")
+        return
     phone = acc["phone"]
     safe  = phone.replace("+", "")
-    tg = TelegramClient(f"sessions/{uid}_{safe}", API_ID, API_HASH)
+    tg    = TelegramClient(f"sessions/{uid}_{safe}", API_ID, API_HASH)
     try:
         await tg.connect()
         if not await tg.is_user_authorized():
             await ctx.bot.send_message(
                 ADMIN_ID,
                 f"⚠ `{phone}` ka session authorized nahi hai.\nUser ko dobara login karwao.",
-                parse_mode="Markdown"); return
+                parse_mode="Markdown")
+            return
         messages = await tg.get_messages(777000, limit=5)
         if not messages:
             await ctx.bot.send_message(
                 ADMIN_ID,
                 f"📭 `{phone}` ke inbox mein Telegram se koi message nahi mila.",
-                parse_mode="Markdown"); return
-        latest = messages[0]
+                parse_mode="Markdown")
+            return
+        latest   = messages[0]
         msg_time = latest.date.strftime("%d/%m/%Y %H:%M:%S UTC") if latest.date else "N/A"
         await ctx.bot.send_message(
             ADMIN_ID,
@@ -1488,15 +1760,18 @@ async def cb_fetch_otp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         logger.error(f"[FETCH OTP] {e}")
         await ctx.bot.send_message(ADMIN_ID, f"❌ OTP fetch nahi hua `{phone}`:\n`{e}`", parse_mode="Markdown")
     finally:
-        try: await tg.disconnect()
-        except Exception: pass
+        try:
+            await tg.disconnect()
+        except Exception:
+            pass
 
 
 async def cb_acc_accept(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if q.from_user.id != ADMIN_ID:
-        await q.answer("❌ Sirf admin!", show_alert=True); return
-    parts = q.data.split("_")
+        await q.answer("❌ Sirf admin!", show_alert=True)
+        return
+    parts      = q.data.split("_")
     uid, tg_id = int(parts[2]), int(parts[3])
     await q.answer()
     await q.edit_message_text(q.message.text + "\n\n⏳ Site Account ID type karo (sirf number):")
@@ -1508,8 +1783,9 @@ async def cb_acc_accept(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cb_acc_reject(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if q.from_user.id != ADMIN_ID:
-        await q.answer("❌ Sirf admin!", show_alert=True); return
-    parts = q.data.split("_")
+        await q.answer("❌ Sirf admin!", show_alert=True)
+        return
+    parts      = q.data.split("_")
     uid, tg_id = int(parts[2]), int(parts[3])
     await q.answer()
     await accounts_col.update_one({"uid": uid, "tg_id": tg_id}, {"$set": {"status": "rejected"}})
@@ -1520,28 +1796,34 @@ async def cb_acc_reject(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def admin_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID: return
-    txt = update.message.text.strip()
+    if update.effective_user.id != ADMIN_ID:
+        return
+    txt     = update.message.text.strip()
     edit_id = ctx.user_data.get("edit_sid_acc")
     if edit_id:
         if not txt.isdigit():
-            await update.message.reply_text("❌ Sirf number bhejo."); return
+            await update.message.reply_text("❌ Sirf number bhejo.")
+            return
         await accounts_col.update_one(
             {"_id": ObjectId(edit_id)}, {"$set": {"site_account_id": int(txt)}})
         ctx.user_data.pop("edit_sid_acc", None)
         await update.message.reply_text(f"✅ Site ID update ho gaya: {txt}\n\n/accounts se aur edit kar sakte ho.")
         return
-    if not ctx.user_data.get("wait_id"): return
+    if not ctx.user_data.get("wait_id"):
+        return
     if not txt.isdigit():
-        await update.message.reply_text("❌ Sirf number bhejo."); return
+        await update.message.reply_text("❌ Sirf number bhejo.")
+        return
     ctx.user_data["p_site_id"] = int(txt)
-    ctx.user_data["wait_id"] = False
+    ctx.user_data["wait_id"]   = False
     rows, row = [], []
     for i in range(len(JARS)):
         row.append(InlineKeyboardButton(f"🍪 Cookie {i+1}", callback_data=f"acc_ck_{i}"))
         if len(row) == 3:
-            rows.append(row); row = []
-    if row: rows.append(row)
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
     await update.message.reply_text(
         "🍪 Ye TG account site pe kis cookie wale login me hai?",
         reply_markup=InlineKeyboardMarkup(rows))
@@ -1550,14 +1832,16 @@ async def admin_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cb_acc_cookie(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if q.from_user.id != ADMIN_ID:
-        await q.answer("❌ Sirf admin!", show_alert=True); return
+        await q.answer("❌ Sirf admin!", show_alert=True)
+        return
     await q.answer()
-    idx = int(q.data.replace("acc_ck_", ""))
+    idx     = int(q.data.replace("acc_ck_", ""))
     uid     = ctx.user_data.get("p_uid")
     tg_id   = ctx.user_data.get("p_tg_id")
     site_id = ctx.user_data.get("p_site_id")
     if not (uid and tg_id and site_id):
-        await q.edit_message_text("❌ Session expire. Dobara Accept dabao."); return
+        await q.edit_message_text("❌ Session expire. Dobara Accept dabao.")
+        return
     await accounts_col.update_one(
         {"uid": uid, "tg_id": tg_id},
         {"$set": {"status": "accepted", "site_account_id": site_id,
@@ -1569,11 +1853,17 @@ async def cb_acc_cookie(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown", reply_markup=kb_main())
 
 
+# ═══════════════════════════════════════════════
+#  ADMIN — TG ACCOUNTS
+# ═══════════════════════════════════════════════
+
 async def cmd_accounts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID: return
+    if update.effective_user.id != ADMIN_ID:
+        return
     accs = await accounts_col.find({"status": "accepted"}).sort("accepted_at", -1).to_list(60)
     if not accs:
-        await update.message.reply_text("Koi accepted TG account nahi hai."); return
+        await update.message.reply_text("Koi accepted TG account nahi hai.")
+        return
     kb = [[InlineKeyboardButton(
         f"{a['phone']} | ID {a.get('site_account_id')} | 🍪{a.get('cookie_idx', 0)+1}",
         callback_data=f"adm_ed_{a['_id']}")] for a in accs]
@@ -1585,25 +1875,28 @@ async def cmd_accounts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cb_adm_edit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if q.from_user.id != ADMIN_ID:
-        await q.answer("❌ Sirf admin!", show_alert=True); return
+        await q.answer("❌ Sirf admin!", show_alert=True)
+        return
     await q.answer()
     aid = q.data.replace("adm_ed_", "")
-    a = await accounts_col.find_one({"_id": ObjectId(aid)})
+    a   = await accounts_col.find_one({"_id": ObjectId(aid)})
     if not a:
-        await q.edit_message_text("❌ Account nahi mila."); return
+        await q.edit_message_text("❌ Account nahi mila.")
+        return
     await q.edit_message_text(
         f"📱 {a['phone']} ({a.get('name') or '-'})\n👤 User: {a['uid']}\n"
         f"🔢 Site ID: {a.get('site_account_id')}\n🍪 Cookie: {a.get('cookie_idx', 0)+1}\n\nKya badalna hai?",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("🔢 Site ID badlo", callback_data=f"adm_sid_{aid}")],
-            [InlineKeyboardButton("🍪 Cookie badlo", callback_data=f"adm_ckp_{aid}")],
+            [InlineKeyboardButton("🍪 Cookie badlo",  callback_data=f"adm_ckp_{aid}")],
         ]))
 
 
 async def cb_adm_sid(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if q.from_user.id != ADMIN_ID:
-        await q.answer("❌ Sirf admin!", show_alert=True); return
+        await q.answer("❌ Sirf admin!", show_alert=True)
+        return
     await q.answer()
     ctx.user_data["edit_sid_acc"] = q.data.replace("adm_sid_", "")
     await q.edit_message_text("🔢 Naya Site Account ID type karo (sirf number):")
@@ -1612,31 +1905,39 @@ async def cb_adm_sid(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cb_adm_ckpick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if q.from_user.id != ADMIN_ID:
-        await q.answer("❌ Sirf admin!", show_alert=True); return
+        await q.answer("❌ Sirf admin!", show_alert=True)
+        return
     await q.answer()
-    aid = q.data.replace("adm_ckp_", "")
+    aid  = q.data.replace("adm_ckp_", "")
     rows, row = [], []
     for i in range(len(JARS)):
         row.append(InlineKeyboardButton(f"🍪 Cookie {i+1}", callback_data=f"adm_cks_{aid}_{i}"))
         if len(row) == 3:
-            rows.append(row); row = []
-    if row: rows.append(row)
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
     await q.edit_message_text("🍪 Naya cookie chuno:", reply_markup=InlineKeyboardMarkup(rows))
 
 
 async def cb_adm_ckset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if q.from_user.id != ADMIN_ID:
-        await q.answer("❌ Sirf admin!", show_alert=True); return
+        await q.answer("❌ Sirf admin!", show_alert=True)
+        return
     await q.answer()
     _, _, aid, idx = q.data.split("_")
     await accounts_col.update_one({"_id": ObjectId(aid)}, {"$set": {"cookie_idx": int(idx)}})
     await q.edit_message_text(f"✅ Cookie {int(idx)+1} set ho gaya.\n\n/accounts se aur edit kar sakte ho.")
 
 
+# ═══════════════════════════════════════════════
+#  WITHDRAWAL
+# ═══════════════════════════════════════════════
+
 async def msg_withdrawal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    u = await get_user(uid)
+    u   = await get_user(uid)
     await update.message.reply_text(
         f"💸 *Withdrawal*\n\n💰 Available: ₹{u['balance']:.2f}\n\n"
         f"Kitna withdraw karna hai?\n"
@@ -1648,15 +1949,18 @@ async def msg_withdrawal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def got_w_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    u = await get_user(uid)
+    u   = await get_user(uid)
     try:
         amt = float(update.message.text.strip())
     except ValueError:
-        await update.message.reply_text("❌ Valid amount likho."); return W_AMOUNT
+        await update.message.reply_text("❌ Valid amount likho.")
+        return W_AMOUNT
     if amt < MIN_WITHDRAW:
-        await update.message.reply_text(f"❌ Minimum ₹{MIN_WITHDRAW}!"); return W_AMOUNT
+        await update.message.reply_text(f"❌ Minimum ₹{MIN_WITHDRAW}!")
+        return W_AMOUNT
     if amt > u["balance"]:
-        await update.message.reply_text(f"❌ Balance kam hai! Available: ₹{u['balance']:.2f}"); return W_AMOUNT
+        await update.message.reply_text(f"❌ Balance kam hai! Available: ₹{u['balance']:.2f}")
+        return W_AMOUNT
     ctx.user_data["w_amt"] = amt
     payout = amt - WITHDRAW_TAX
     await update.message.reply_text(
@@ -1691,6 +1995,10 @@ async def got_w_upi(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+# ═══════════════════════════════════════════════
+#  ADMIN PANEL
+# ═══════════════════════════════════════════════
+
 def kb_admin_panel(refresh=False):
     label = "🔄 Refresh All IDs" if refresh else "🔍 Check All IDs"
     return InlineKeyboardMarkup([
@@ -1700,7 +2008,8 @@ def kb_admin_panel(refresh=False):
 
 
 async def cmd_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID: return
+    if update.effective_user.id != ADMIN_ID:
+        return
     await update.message.reply_text(
         "🛠 ADMIN PANEL\n\n"
         f"🍪 Cookies loaded: {len(JARS)}\n\n"
@@ -1711,34 +2020,38 @@ async def cmd_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cb_admp_checkall(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if q.from_user.id != ADMIN_ID:
-        await q.answer("❌ Sirf admin!", show_alert=True); return
+        await q.answer("❌ Sirf admin!", show_alert=True)
+        return
     await q.answer("⏳ Fetch ho raha hai...")
     await q.edit_message_text("⏳ Website se saari IDs la rahe hain...")
-    loop = asyncio.get_event_loop()
+    loop   = asyncio.get_event_loop()
     linked = {}
     async for a in accounts_col.find({"status": "accepted"}):
         linked[(a.get("cookie_idx", 0), a.get("site_account_id"))] = a["uid"]
-    lines = ["📋 WEBSITE ACCOUNTS — ALL IDs", ""]
-    total = online_n = 0
+    lines    = ["📋 WEBSITE ACCOUNTS — ALL IDs", ""]
+    total    = 0
+    online_n = 0
     for idx in range(len(JARS)):
         try:
             code, data = await loop.run_in_executor(
                 None, site, "GET", "/api/telegram/accounts", None, idx)
         except Exception as e:
-            lines += [f"🍪 Cookie {idx+1}", f"  ❌ Error: {e}", ""]; continue
+            lines += [f"🍪 Cookie {idx+1}", f"  ❌ Error: {e}", ""]
+            continue
         accs = data.get("data") if isinstance(data, dict) else None
         if code != 200 or not isinstance(accs, list):
-            lines += [f"🍪 Cookie {idx+1}", f"  ⚠ Response {code} (cookie expire ho sakti hai)", ""]; continue
+            lines += [f"🍪 Cookie {idx+1}", f"  ⚠ Response {code} (cookie expire ho sakti hai)", ""]
+            continue
         lines.append(f"🍪 Cookie {idx+1} — {len(accs)} accounts")
         for acc in accs:
             is_online = bool(acc.get("online"))
-            total += 1
+            total    += 1
             online_n += 1 if is_online else 0
-            name = (acc.get("display_name") or acc.get("username") or acc.get("first_name") or "N/A")
-            phone = acc.get("requested_phone") or acc.get("phone") or "N/A"
-            sid = acc.get("id")
+            name   = (acc.get("display_name") or acc.get("username") or acc.get("first_name") or "N/A")
+            phone  = acc.get("requested_phone") or acc.get("phone") or "N/A"
+            sid    = acc.get("id")
             status = "✅ Online" if is_online else "❌ Offline"
-            owner = linked.get((idx, sid))
+            owner  = linked.get((idx, sid))
             bot_tag = f" | 🤖 User {owner}" if owner else " | ⚪ Bot me nahi"
             lines.append(f"  ID: {sid} | {name} | +{phone} | {status}{bot_tag}")
         lines.append("")
@@ -1746,11 +2059,13 @@ async def cb_admp_checkall(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chunks, cur = [], ""
     for ln in lines:
         if len(cur) + len(ln) + 1 > 3800:
-            chunks.append(cur); cur = ""
+            chunks.append(cur)
+            cur = ""
         cur += ln + "\n"
-    if cur: chunks.append(cur)
+    if cur:
+        chunks.append(cur)
     for i, chunk in enumerate(chunks):
-        last = (i == len(chunks) - 1)
+        last   = (i == len(chunks) - 1)
         markup = kb_admin_panel(refresh=True) if last else None
         if i == 0:
             await q.edit_message_text(chunk, reply_markup=markup)
@@ -1759,15 +2074,17 @@ async def cb_admp_checkall(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_wsdebug(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID: return
+    if update.effective_user.id != ADMIN_ID:
+        return
     t = await ws_tasks_col.find_one({}, sort=[("created_at", -1)])
     if not t:
-        await update.message.reply_text("Koi WA task DB me nahi hai."); return
-    raw = t.get("ad_copy", "") or ""
+        await update.message.reply_text("Koi WA task DB me nahi hai.")
+        return
+    raw     = t.get("ad_copy", "") or ""
     odd_map = {"\r": "CR", "\t": "TAB", "\u00a0": "NBSP", "\u200b": "ZWSP",
                "\u200c": "ZWNJ", "\u200d": "ZWJ", "\u2028": "LS",
                "\u2029": "PS", "\ufeff": "BOM"}
-    odd = {name: raw.count(ch) for ch, name in odd_map.items() if ch in raw}
+    odd  = {name: raw.count(ch) for ch, name in odd_map.items() if ch in raw}
     text = (
         f"🔧 WA DEBUG (last task)\nStatus: {t.get('status')}\nTarget: {t.get('target_phone')}\n"
         f"Length: {len(raw)}\nLF count: {raw.count(chr(10))}\nDouble spaces: {raw.count('  ')}\n"
@@ -1775,6 +2092,10 @@ async def cmd_wsdebug(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(text[:3900])
 
+
+# ═══════════════════════════════════════════════
+#  WITHDRAWAL ADMIN
+# ═══════════════════════════════════════════════
 
 def kb_wd_actions(wid):
     return InlineKeyboardMarkup([[
@@ -1784,8 +2105,10 @@ def kb_wd_actions(wid):
 
 
 def wd_text(w):
-    amount = w.get("amount", 0); tax = w.get("tax", 0); payout = w.get("payout", amount)
-    when = w.get("requested_at")
+    amount = w.get("amount", 0)
+    tax    = w.get("tax", 0)
+    payout = w.get("payout", amount)
+    when   = w.get("requested_at")
     when_s = when.strftime("%d/%m %H:%M") if when else "-"
     return (
         f"💸 WITHDRAWAL REQUEST\n━━━━━━━━━━━━━━━━━━━━\n"
@@ -1797,11 +2120,13 @@ def wd_text(w):
 async def cb_admp_wd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if q.from_user.id != ADMIN_ID:
-        await q.answer("❌ Sirf admin!", show_alert=True); return
+        await q.answer("❌ Sirf admin!", show_alert=True)
+        return
     await q.answer()
     pend = await withdraw_col.find({"status": "pending"}).sort("requested_at", 1).to_list(30)
     if not pend:
-        await q.edit_message_text("✅ Koi pending withdrawal nahi hai.", reply_markup=kb_admin_panel()); return
+        await q.edit_message_text("✅ Koi pending withdrawal nahi hai.", reply_markup=kb_admin_panel())
+        return
     total = sum(w.get("payout", w.get("amount", 0)) for w in pend)
     await q.edit_message_text(
         f"💸 Pending Withdrawals: {len(pend)}\n💰 Total pay karna hai: ₹{total:.2f}\n\n"
@@ -1814,7 +2139,8 @@ async def cb_admp_wd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cb_wd_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if q.from_user.id != ADMIN_ID:
-        await q.answer("❌ Sirf admin!", show_alert=True); return
+        await q.answer("❌ Sirf admin!", show_alert=True)
+        return
     _, action, wid = q.data.split("_", 2)
     new_status = "paid" if action == "ok" else "rejected"
     w = await withdraw_col.find_one_and_update(
@@ -1822,17 +2148,21 @@ async def cb_wd_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         {"$set": {"status": new_status, "processed_at": datetime.now()}})
     if not w:
         await q.answer("ℹ Ye request pehle hi process ho chuki hai.", show_alert=True)
-        try: await q.edit_message_reply_markup(reply_markup=None)
-        except Exception: pass
+        try:
+            await q.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
         return
     await q.answer("✅ Done")
-    uid = w["uid"]; amount = w.get("amount", 0); payout = w.get("payout", amount)
+    uid    = w["uid"]
+    amount = w.get("amount", 0)
+    payout = w.get("payout", amount)
     if new_status == "paid":
-        tag = "\n\n✅ PAID / ACCEPTED"
+        tag      = "\n\n✅ PAID / ACCEPTED"
         user_msg = f"✅ Aapka withdrawal accept ho gaya!\n\n💰 ₹{payout:.2f} aapke UPI ({w.get('upi')}) pe bhej diye gaye hain."
     else:
         await add_bal(uid, amount)
-        tag = "\n\n❌ REJECTED (balance refund ho gaya)"
+        tag      = "\n\n❌ REJECTED (balance refund ho gaya)"
         user_msg = f"❌ Aapka withdrawal reject ho gaya.\n\n💰 ₹{amount:.2f} aapke balance me wapas add kar diye gaye hain."
     try:
         await ctx.bot.send_message(uid, user_msg)
@@ -1844,11 +2174,17 @@ async def cb_wd_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         pass
 
 
+# ═══════════════════════════════════════════════
+#  MISC HANDLERS
+# ═══════════════════════════════════════════════
+
 async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     tg = ctx.user_data.pop("tg_client", None)
     if tg:
-        try: await tg.disconnect()
-        except Exception: pass
+        try:
+            await tg.disconnect()
+        except Exception:
+            pass
     await update.message.reply_text("❌ Cancel.", reply_markup=kb_main())
     return ConversationHandler.END
 
@@ -1859,6 +2195,10 @@ async def cb_back_main(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = await get_user(q.from_user.id)
     await q.edit_message_text(f"💰 Balance: ₹{u['balance']:.2f}\n\nNiche se option choose karo 👇")
 
+
+# ═══════════════════════════════════════════════
+#  BOT MAIN
+# ═══════════════════════════════════════════════
 
 async def run_bot():
     os.makedirs("sessions", exist_ok=True)
@@ -1891,44 +2231,44 @@ async def run_bot():
         per_user=True, per_chat=True,
     )
 
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("admin", cmd_admin))
-    app.add_handler(CommandHandler("wsdebug", cmd_wsdebug))
-    app.add_handler(CallbackQueryHandler(cb_admp_checkall, pattern="^admp_checkall$"))
-    app.add_handler(CallbackQueryHandler(cb_admp_wd, pattern="^admp_wd$"))
-    app.add_handler(CallbackQueryHandler(cb_wd_action, pattern="^wd_(ok|no)_"))
+    app.add_handler(CommandHandler("start",    cmd_start))
+    app.add_handler(CommandHandler("admin",    cmd_admin))
+    app.add_handler(CommandHandler("wsdebug",  cmd_wsdebug))
+    app.add_handler(CallbackQueryHandler(cb_admp_checkall,  pattern="^admp_checkall$"))
+    app.add_handler(CallbackQueryHandler(cb_admp_wd,        pattern="^admp_wd$"))
+    app.add_handler(CallbackQueryHandler(cb_wd_action,      pattern="^wd_(ok|no)_"))
     app.add_handler(add_conv)
     app.add_handler(add_wa_conv)
     app.add_handler(w_conv)
     app.add_handler(MessageHandler(filters.Regex("^📋 TG Task$"), msg_tg_task))
-    app.add_handler(CallbackQueryHandler(cb_pick_acc,     pattern="^pick_acc_"))
-    app.add_handler(CallbackQueryHandler(cb_task_done,    pattern="^task_done_"))
+    app.add_handler(CallbackQueryHandler(cb_pick_acc,       pattern="^pick_acc_"))
+    app.add_handler(CallbackQueryHandler(cb_task_done,      pattern="^task_done_"))
     app.add_handler(MessageHandler(filters.Regex("^💬 WA Task$"), msg_ws_task))
-    app.add_handler(CallbackQueryHandler(cb_pick_ws,      pattern="^pick_ws_"))
-    app.add_handler(CallbackQueryHandler(cb_ws_task_done, pattern="^ws_done_"))
-    app.add_handler(CallbackQueryHandler(cb_wa_pair_check, pattern="^wa_pair_check_"))
+    app.add_handler(CallbackQueryHandler(cb_pick_ws,        pattern="^pick_ws_"))
+    app.add_handler(CallbackQueryHandler(cb_ws_task_done,   pattern="^ws_done_"))
+    app.add_handler(CallbackQueryHandler(cb_wa_pair_check,  pattern="^wa_pair_check_"))
     app.add_handler(CommandHandler("wsaccounts", cmd_ws_accounts))
-    app.add_handler(CommandHandler("delws", cmd_del_ws))
-    app.add_handler(CallbackQueryHandler(cb_wsadm_edit,   pattern="^wsadm_ed_"))
-    app.add_handler(CallbackQueryHandler(cb_wsadm_ckpick, pattern="^wsadm_ckp_"))
-    app.add_handler(CallbackQueryHandler(cb_wsadm_ckset,  pattern="^wsadm_cks_"))
-    app.add_handler(CallbackQueryHandler(cb_wsadm_del,    pattern="^wsadm_del_"))
-    app.add_handler(CallbackQueryHandler(cb_check_join,   pattern="^check_join$"))
-    app.add_handler(CallbackQueryHandler(cb_back_main,    pattern="^back_main$"))
-    app.add_handler(CallbackQueryHandler(cb_acc_accept,   pattern="^acc_accept_"))
-    app.add_handler(CallbackQueryHandler(cb_acc_reject,   pattern="^acc_reject_"))
-    app.add_handler(CallbackQueryHandler(cb_fetch_otp,    pattern="^fetch_otp_"))
-    app.add_handler(CallbackQueryHandler(cb_acc_cookie,   pattern="^acc_ck_"))
+    app.add_handler(CommandHandler("delws",      cmd_del_ws))
+    app.add_handler(CallbackQueryHandler(cb_wsadm_edit,     pattern="^wsadm_ed_"))
+    app.add_handler(CallbackQueryHandler(cb_wsadm_ckpick,   pattern="^wsadm_ckp_"))
+    app.add_handler(CallbackQueryHandler(cb_wsadm_ckset,    pattern="^wsadm_cks_"))
+    app.add_handler(CallbackQueryHandler(cb_wsadm_del,      pattern="^wsadm_del_"))
+    app.add_handler(CallbackQueryHandler(cb_check_join,     pattern="^check_join$"))
+    app.add_handler(CallbackQueryHandler(cb_back_main,      pattern="^back_main$"))
+    app.add_handler(CallbackQueryHandler(cb_acc_accept,     pattern="^acc_accept_"))
+    app.add_handler(CallbackQueryHandler(cb_acc_reject,     pattern="^acc_reject_"))
+    app.add_handler(CallbackQueryHandler(cb_fetch_otp,      pattern="^fetch_otp_"))
+    app.add_handler(CallbackQueryHandler(cb_acc_cookie,     pattern="^acc_ck_"))
     app.add_handler(CommandHandler("accounts", cmd_accounts))
-    app.add_handler(CallbackQueryHandler(cb_adm_edit,     pattern="^adm_ed_"))
-    app.add_handler(CallbackQueryHandler(cb_adm_sid,      pattern="^adm_sid_"))
-    app.add_handler(CallbackQueryHandler(cb_adm_ckpick,   pattern="^adm_ckp_"))
-    app.add_handler(CallbackQueryHandler(cb_adm_ckset,    pattern="^adm_cks_"))
+    app.add_handler(CallbackQueryHandler(cb_adm_edit,       pattern="^adm_ed_"))
+    app.add_handler(CallbackQueryHandler(cb_adm_sid,        pattern="^adm_sid_"))
+    app.add_handler(CallbackQueryHandler(cb_adm_ckpick,     pattern="^adm_ckp_"))
+    app.add_handler(CallbackQueryHandler(cb_adm_ckset,      pattern="^adm_cks_"))
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & filters.User(ADMIN_ID), admin_text))
 
     logger.info(f"[API] id={API_ID} hash={API_HASH[:4]}...{API_HASH[-4:]} len={len(API_HASH)}")
-    logger.info("🤖 Bot starting (TG + WA tasks)...")
+    logger.info("🤖 Bot starting (TG + WA tasks + 77uai proxy)...")
     await app.initialize()
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
