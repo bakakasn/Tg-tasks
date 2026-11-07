@@ -19,6 +19,17 @@ try:
     from telegram import CopyTextButton   # python-telegram-bot v21.7+
 except ImportError:
     CopyTextButton = None
+try:
+    from telegram import LinkPreviewOptions   # PTB v20.8+
+except ImportError:
+    LinkPreviewOptions = None
+
+
+def no_preview():
+    """Link preview band (message lamba na ho)."""
+    if LinkPreviewOptions:
+        return {"link_preview_options": LinkPreviewOptions(is_disabled=True)}
+    return {"disable_web_page_preview": True}
 
 
 def copy_button(label, text):
@@ -725,51 +736,53 @@ def raw_ad_copy(text):
     return text or ""
 
 async def _send_ws_task(msg, task, time_left):
+    """Website ke "WhatsApp tasks" page jaisa layout — ek hi message."""
     mins, secs = time_left // 60, time_left % 60
     target = task.get("target_phone", "")
     username = task.get("target_username", "")
+    pts_min = task.get("reward_min_points", 150)
+    pts_max = task.get("reward_max_points", 250)
 
     # EXACT site wala text — strip/replace kuch nahi
     raw_msg = raw_ad_copy(task.get("ad_copy", ""))
+    show_msg = raw_msg.replace("\r\n", "\n").replace("\r", "\n")
 
-    # safe="" → har special char (space, newline, /, &, ?) sahi encode hoga
-    # \r\n → %0D%0A (bilkul site jaisa)
     wa_text = raw_msg.replace("\r\n", "\n").replace("\r", "\n") if WA_LINK_LF else raw_msg
     wa_link = (
         f"https://wa.me/{target}?text={urllib.parse.quote(wa_text, safe='')}"
         if target else ""
     )
 
-    info = (
-        f"💬 WHATSAPP TASK\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📱 WA Account: {task.get('ws_phone', '')}\n"
-        f"📲 Number: +{target}\n"
+    text = (
+        f"💬 <b>WhatsApp tasks</b>\n\n"
+        f"⏳ <b>YOUR CURRENT TASK</b>  {mins:02d}:{secs:02d}   (+{pts_min}–{pts_max} pts)\n"
+        f"💰 Reward: ₹{WS_TASK_REWARD:.2f}\n\n"
+        f"<b>SEND TO THIS WHATSAPP NUMBER</b>\n"
+        f"<code>+{html.escape(str(target))}</code>\n"
     )
     if username:
-        info += f"👤 Username: @{username}\n"
-    info += (
-        f"⏳ Time: {mins}m {secs}s\n"
-        f"💰 Reward: ₹{WS_TASK_REWARD:.2f}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"👇 Button dabao → WA khulega → message ready → bas Send karo"
+        text += f"👤 @{html.escape(str(username))}\n"
+    text += (
+        f"\n<b>MESSAGE TO SEND</b>\n"
+        f"<blockquote>{html.escape(show_msg)}</blockquote>\n"
+        f"📱 Isi WA account se bhejo: <code>{html.escape(str(task.get('ws_phone', '')))}</code>"
     )
 
     buttons = []
     if wa_link:
         buttons.append([InlineKeyboardButton("📲 Open WhatsApp — Send Karo", url=wa_link)])
+    copy_row = []
+    if raw_msg and len(show_msg) <= 256:
+        copy_row.append(copy_button("📋 Copy Message", show_msg))
+    if target:
+        copy_row.append(copy_button("📞 Copy Number", f"+{target}"))
+    if copy_row:
+        buttons.append(copy_row)
     buttons.append([InlineKeyboardButton("✅ Done — Check Karo", callback_data=f"ws_done_{task['_id']}")])
 
-    await msg.reply_text(info, reply_markup=InlineKeyboardMarkup(buttons))
-
-    # Exact message <pre> block me (spaces/lines preserve) + Copy button
-    if raw_msg:
-        copy_kb = None
-        if len(raw_msg) <= 256:
-            copy_kb = InlineKeyboardMarkup([[copy_button("📋 Copy Message", raw_msg)]])
-        await msg.reply_text(
-            f"<pre>{html.escape(raw_msg)}</pre>",
-            parse_mode="HTML", reply_markup=copy_kb)
+    await msg.reply_text(
+        text, parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(buttons), **no_preview())
 
 async def cb_ws_task_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
