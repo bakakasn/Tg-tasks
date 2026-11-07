@@ -72,13 +72,13 @@ SITE_URL     = os.getenv("SITE_URL", "https://77uai.com")
 COOKIE_FILE  = os.getenv("COOKIE_FILE", "cookies.txt")
 PUBLIC_URL   = os.getenv("PUBLIC_URL") or os.getenv("RENDER_EXTERNAL_URL") or "https://tg-tasks.onrender.com"
 
-TASK_REWARD     = 0.25       # Telegram task reward (INR)
-WS_TASK_REWARD  = 0.25       # WhatsApp task reward (INR)
+TASK_REWARD     = 0.25
+WS_TASK_REWARD  = 0.25
 WA_LINK_LF      = os.getenv("WA_LINK_LF", "1") == "1"
-MIN_WITHDRAW    = 5          # minimum withdrawal (INR)
-WITHDRAW_TAX    = 2          # har withdrawal pe tax (INR)
-TASK_TIMEOUT    = 540        # seconds (9 min)
-WS_TASK_TIMEOUT = 600        # seconds (10 min)
+MIN_WITHDRAW    = 5
+WITHDRAW_TAX    = 2
+TASK_TIMEOUT    = 540
+WS_TASK_TIMEOUT = 600
 
 IST = ZoneInfo("Asia/Kolkata")
 TASK_START_HOUR = 8
@@ -115,13 +115,6 @@ def copy_page_url(text, target):
     url = f"{PUBLIC_URL.rstrip('/')}/m?d={_b64e(payload)}"
     return url if len(url) <= 2000 else ""
 
-# ══════════════════════════════════════════════════════
-#  COPY PAGE HTML — message format EXACT same as site
-#  Key fixes:
-#  1. <pre> tag for msgbox — preserves \n\n on copy
-#  2. JS copyEl uses innerText (not textContent) — newlines intact
-#  3. font-family override on pre — same as body font
-# ══════════════════════════════════════════════════════
 _COPY_PAGE = """<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8">
@@ -146,7 +139,6 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
         display:flex;align-items:center;justify-content:space-between}
 .numbox .icon{color:#c0392b;font-size:20px;cursor:pointer;padding:4px 8px}
 
-/* FIX: pre tag use, font override, white-space:pre-wrap, word-break */
 .msgbox{background:#fff;border:1.5px solid #e0e0e0;border-radius:10px;
         padding:16px;font-size:16px;line-height:1.6;
         white-space:pre-wrap;word-wrap:break-word;word-break:break-word;
@@ -188,18 +180,14 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
 
 <script>
 function copyMsg(){
-  /* FIX: innerText on <pre> preserves \n\n paragraphs exactly */
   var el = document.getElementById('msg');
-  /* Remove the icon span text from copy */
   var iconSpan = el.querySelector('.icon');
   var iconText = iconSpan ? (iconSpan.innerText || iconSpan.textContent) : '';
   var fullText = el.innerText || el.textContent;
-  /* Strip icon text from end */
   var t = fullText;
   if(iconText && t.endsWith(iconText)){
     t = t.slice(0, t.length - iconText.length);
   }
-  /* Only trim leading/trailing newlines/spaces — preserve inner \n\n */
   t = t.replace(/^[\r\n\s]+|[\r\n\s]+$/g, '');
   doCopy(t);
 }
@@ -252,8 +240,6 @@ def render_copy_page(text, target):
         open_btn = f'<a class="btn btn-wa" href="{html.escape(wa)}">&#x1F4F2; Open in WhatsApp</a>'
         num_copy_btn = '<button class="btn btn-num" onclick="copyEl(\'num\')">&#x1F4DE; Copy Number</button>'
 
-    # FIX: html.escape preserves \n as-is inside <pre> — browser renders correctly
-    # Do NOT replace \n with <br> — pre tag handles it natively
     escaped_text = html.escape(text)
 
     return (_COPY_PAGE
@@ -270,7 +256,6 @@ class _PingHandler(BaseHTTPRequestHandler):
             try:
                 raw = urllib.parse.parse_qs(parsed.query).get("d", [""])[0]
                 data = json.loads(_b64d(raw))
-                # FIX: use raw message text — no extra strip/replace
                 msg_text = str(data.get("m", ""))
                 body = render_copy_page(msg_text, str(data.get("t", ""))).encode("utf-8")
             except Exception:
@@ -918,21 +903,25 @@ async def start_ws_task(uid, acc, msg):
         await msg.reply_text("❌ Error aaya, dobara try karo.")
 
 
+# ══════════════════════════════════════════════════════
+#  AD COPY HELPERS — FIXED
+# ══════════════════════════════════════════════════════
 def clean_ad_copy(text):
-    """Display ke liye sirf \\r\\n → \\n (Telegram mein sahi dikhe)."""
+    """Display ke liye — paragraph gaps preserve, sirf line ending fix."""
     if not text:
         return ""
-    return text.replace("\r\n", "\n").replace("\r", "\n")
+    text = text.replace("\r\n\r\n", "\n\n")
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    return text
 
 
 def raw_ad_copy(text):
-    """
-    WA pe bhejne ke liye — \\r\\n ko \\n karo taaki paragraphs preserve hon.
-    FIX: \r\n → \n — yahi asli message format hai, strip mat karo.
-    """
+    """WA pe bhejne ke liye — paragraph gaps preserve, sirf line ending fix."""
     if not text:
         return ""
-    return text.replace("\r\n", "\n").replace("\r", "\n")
+    text = text.replace("\r\n\r\n", "\n\n")
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    return text
 
 
 async def _send_ws_task(msg, task, time_left):
@@ -942,11 +931,9 @@ async def _send_ws_task(msg, task, time_left):
     pts_min = task.get("reward_min_points", 150)
     pts_max = task.get("reward_max_points", 250)
 
-    # FIX: \r\n → \n everywhere — paragraphs preserve karo
     raw_msg = raw_ad_copy(task.get("ad_copy", ""))
-    show_msg = raw_msg  # already \r\n → \n done in raw_ad_copy
+    show_msg = raw_msg
 
-    # WA link: \n → %0A (urllib.parse.quote handles it)
     wa_link = (
         f"https://wa.me/{target}?text={urllib.parse.quote(raw_msg, safe='')}"
         if target else ""
@@ -970,7 +957,6 @@ async def _send_ws_task(msg, task, time_left):
     buttons = []
     if wa_link:
         buttons.append([InlineKeyboardButton("📲 Open WhatsApp — Send Karo", url=wa_link)])
-    # FIX: web page me show_msg bhejo — same \n\n format, no stripping
     page_url = copy_page_url(show_msg, target) if raw_msg else ""
     if page_url:
         buttons.append([InlineKeyboardButton("🌐 Web Page — Message Copy Karo", url=page_url)])
@@ -1226,10 +1212,10 @@ async def got_wa_phone(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"⏰ Valid: {mins}m {secs}s\n\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"*WhatsApp pe yeh karo:*\n\n"
-            f"1️⃣ WhatsApp app kholo\n"
-            f"2️⃣ 3 dots (⋮) → Linked Devices\n"
-            f"3️⃣ *Link with Phone Number* dabao\n"
-            f"4️⃣ Upar diya hua code enter karo\n\n"
+            f"1⃣ WhatsApp app kholo\n"
+            f"2⃣ 3 dots (⋮) → Linked Devices\n"
+            f"3⃣ *Link with Phone Number* dabao\n"
+            f"4⃣ Upar diya hua code enter karo\n\n"
             f"⚠ *{mins} minute ke andar enter karo!*",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[
@@ -1481,7 +1467,7 @@ async def cb_wsadm_ckset(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if q.from_user.id != ADMIN_ID:
         await q.answer("❌ Sirf admin!", show_alert=True); return
     await q.answer()
-    parts = q.data.split("_")   # wsadm_cks_<aid>_<idx>
+    parts = q.data.split("_")
     aid = parts[2]
     idx = int(parts[3])
     await ws_accounts_col.update_one({"_id": ObjectId(aid)}, {"$set": {"cookie_idx": idx}})
