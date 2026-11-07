@@ -1,5 +1,7 @@
 import os
 import html
+import json
+import base64
 import logging
 import asyncio
 import tempfile
@@ -68,6 +70,7 @@ CHANNEL_ID   = os.getenv("CHANNEL_ID", "")
 CHANNEL_LINK = os.getenv("CHANNEL_LINK", "")
 SITE_URL     = os.getenv("SITE_URL", "https://77uai.com")
 COOKIE_FILE  = os.getenv("COOKIE_FILE", "cookies.txt")
+PUBLIC_URL   = os.getenv("PUBLIC_URL") or os.getenv("RENDER_EXTERNAL_URL") or "https://tg-tasks.onrender.com"
 
 TASK_REWARD     = 0.25       # Telegram task reward (INR)
 WS_TASK_REWARD  = 0.25       # WhatsApp task reward (INR) — adjust karein
@@ -101,8 +104,158 @@ ADD_PHONE, ADD_OTP, ADD_2FA, W_AMOUNT, W_UPI = range(5)
 # ══════════════════════════════════════════════════════
 #  HTTP SERVER
 # ══════════════════════════════════════════════════════
+def _b64e(text):
+    return base64.urlsafe_b64encode(text.encode("utf-8")).decode().rstrip("=")
+
+def _b64d(text):
+    return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4)).decode("utf-8")
+
+def copy_page_url(text, target):
+    """Message copy karne wala web page ka link (data URL me hi hai, DB ki zaroorat nahi)."""
+    payload = json.dumps({"m": text, "t": target}, ensure_ascii=False)
+    url = f"{PUBLIC_URL.rstrip('/')}/m?d={_b64e(payload)}"
+    return url if len(url) <= 2000 else ""
+
+_COPY_PAGE = """<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WhatsApp Task</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+     background:#f5f5f5;color:#111;min-height:100vh}
+
+/* Top red bar — site jaisa */
+.topbar{background:#c0392b;height:5px;width:100%}
+
+.wrap{max-width:540px;margin:0 auto;padding:20px 16px 40px}
+
+/* Title */
+.title{font-size:22px;font-weight:700;color:#c0392b;margin:16px 0 20px}
+
+/* Section label — BOLD CAPS site jaisa */
+.label{font-size:11px;font-weight:800;letter-spacing:.1em;color:#555;
+       margin:20px 0 8px;text-transform:uppercase}
+
+/* Number box */
+.numbox{background:#fff;border:1.5px solid #e0e0e0;border-radius:10px;
+        padding:14px 16px;font-size:19px;font-weight:700;color:#111;
+        display:flex;align-items:center;justify-content:space-between}
+.numbox .icon{color:#c0392b;font-size:20px;cursor:pointer;padding:4px 8px}
+
+/* Message box — site jaisa white box */
+.msgbox{background:#fff;border:1.5px solid #e0e0e0;border-radius:10px;
+        padding:16px;font-size:16px;line-height:1.6;white-space:pre-wrap;
+        word-wrap:break-word;color:#111;position:relative;min-height:80px}
+.msgbox .icon{position:absolute;top:12px;right:12px;color:#c0392b;
+              font-size:20px;cursor:pointer}
+
+/* Buttons */
+.btn{display:block;width:100%;border:0;border-radius:10px;padding:15px;
+     font-size:16px;font-weight:700;text-align:center;text-decoration:none;
+     margin-top:14px;cursor:pointer;transition:opacity .15s}
+.btn:active{opacity:.8}
+.btn-copy{background:#c0392b;color:#fff}
+.btn-wa{background:#25d366;color:#fff}
+.btn-num{background:#fff;color:#111;border:1.5px solid #ddd;margin-top:10px}
+
+/* Toast */
+.toast{display:none;position:fixed;bottom:30px;left:50%;transform:translateX(-50%);
+       background:#333;color:#fff;padding:10px 24px;border-radius:24px;
+       font-size:15px;font-weight:600;z-index:999}
+.toast.show{display:block}
+</style></head>
+<body>
+<div class="topbar"></div>
+<div class="wrap">
+  <div class="title">WhatsApp tasks</div>
+
+  __NUMBLOCK__
+
+  <div class="label">Message to send</div>
+  <div class="msgbox" id="msg">__MSG__<span class="icon" onclick="copyEl('msg')" title="Copy">⧉</span></div>
+
+  <button class="btn btn-copy" onclick="copyEl('msg')">📋 Copy Message</button>
+  __OPENBTN__
+  __NUMCOPYBTN__
+</div>
+
+<div class="toast" id="toast">✅ Copied!</div>
+
+<script>
+function copyEl(id){
+  const el = document.getElementById(id);
+  // icon span ko exclude karo
+  let t = '';
+  el.childNodes.forEach(function(n){
+    if(n.nodeType===3) t += n.textContent;
+    else if(n.className!=='icon') t += n.textContent;
+  });
+  t = t.trim();
+  if(navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(t).then(function(){showToast();}).catch(function(){fallback(t);});
+  } else { fallback(t); }
+}
+function fallback(t){
+  var ta=document.createElement('textarea');
+  ta.value=t;ta.style.position='fixed';ta.style.opacity='0';
+  document.body.appendChild(ta);ta.focus();ta.select();
+  try{document.execCommand('copy');}catch(e){}
+  document.body.removeChild(ta);
+  showToast();
+}
+function showToast(){
+  var d=document.getElementById('toast');
+  d.classList.add('show');
+  setTimeout(function(){d.classList.remove('show');},1600);
+}
+</script>
+</body></html>"""
+
+def render_copy_page(text, target):
+    # Number block
+    num_block = ""
+    open_btn = ""
+    num_copy_btn = ""
+    if target:
+        num_block = (
+            '<div class="label">Send to this WhatsApp number</div>'
+            f'<div class="numbox" id="num">'
+            f'<span>+{html.escape(target)}</span>'
+            f'<span class="icon" onclick="copyEl(\'num\')" title="Copy">⧉</span>'
+            f'</div>'
+        )
+        # WA link mein \r\n → \n (WA app %0D nahi chahta)
+        wa_text = text.replace("\r\n", "\n").replace("\r", "\n")
+        wa = f"https://wa.me/{target}?text={urllib.parse.quote(wa_text, safe='')}"
+        open_btn = f'<a class="btn btn-wa" href="{html.escape(wa)}">📲 Open in WhatsApp</a>'
+        num_copy_btn = '<button class="btn btn-num" onclick="copyEl(\'num\')">📞 Copy Number</button>'
+
+    return (_COPY_PAGE
+            .replace("__NUMBLOCK__", num_block)
+            .replace("__OPENBTN__", open_btn)
+            .replace("__NUMCOPYBTN__", num_copy_btn)
+            .replace("__MSG__", html.escape(text)))
+
 class _PingHandler(BaseHTTPRequestHandler):
     def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/m":
+            try:
+                raw = urllib.parse.parse_qs(parsed.query).get("d", [""])[0]
+                data = json.loads(_b64d(raw))
+                body = render_copy_page(str(data.get("m", "")), str(data.get("t", ""))).encode("utf-8")
+            except Exception:
+                self.send_response(400); self.end_headers()
+                self.wfile.write(b"bad link"); return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         self.send_response(200); self.end_headers()
         self.wfile.write(b"ok")
     def log_message(self, *a): pass
@@ -771,6 +924,9 @@ async def _send_ws_task(msg, task, time_left):
     buttons = []
     if wa_link:
         buttons.append([InlineKeyboardButton("📲 Open WhatsApp — Send Karo", url=wa_link)])
+    page_url = copy_page_url(show_msg, target) if raw_msg else ""
+    if page_url:
+        buttons.append([InlineKeyboardButton("🌐 Web Page — Message Copy Karo", url=page_url)])
     copy_row = []
     if raw_msg and len(show_msg) <= 256:
         copy_row.append(copy_button("📋 Copy Message", show_msg))
