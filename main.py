@@ -52,6 +52,7 @@ COOKIE_FILE  = os.getenv("COOKIE_FILE", "cookies.txt")
 
 TASK_REWARD     = 0.25       # Telegram task reward (INR)
 WS_TASK_REWARD  = 0.25       # WhatsApp task reward (INR) — adjust karein
+WA_LINK_LF      = os.getenv("WA_LINK_LF", "0") == "1"   # 1 = link me \r\n ko \n bana do
 MIN_WITHDRAW    = 5          # minimum withdrawal (INR)
 WITHDRAW_TAX    = 2          # har withdrawal pe tax (INR)
 TASK_TIMEOUT    = 540        # seconds (9 min)
@@ -723,8 +724,9 @@ async def _send_ws_task(msg, task, time_left):
 
     # safe="" → har special char (space, newline, /, &, ?) sahi encode hoga
     # \r\n → %0D%0A (bilkul site jaisa)
+    wa_text = raw_msg.replace("\r\n", "\n").replace("\r", "\n") if WA_LINK_LF else raw_msg
     wa_link = (
-        f"https://wa.me/{target}?text={urllib.parse.quote(raw_msg, safe='')}"
+        f"https://wa.me/{target}?text={urllib.parse.quote(wa_text, safe='')}"
         if target else ""
     )
 
@@ -750,9 +752,15 @@ async def _send_ws_task(msg, task, time_left):
 
     await msg.reply_text(info, reply_markup=InlineKeyboardMarkup(buttons))
 
-    # Exact site jaisa message alag (copy ke liye)
+    # Exact message <pre> block me (spaces/lines preserve) + Copy button
     if raw_msg:
-        await msg.reply_text(raw_msg)
+        copy_kb = None
+        if CopyTextButton and len(raw_msg) <= 256:
+            copy_kb = InlineKeyboardMarkup([[InlineKeyboardButton(
+                "📋 Copy Message", copy_text=CopyTextButton(text=raw_msg))]])
+        await msg.reply_text(
+            f"<pre>{html.escape(raw_msg)}</pre>",
+            parse_mode="HTML", reply_markup=copy_kb)
 
 async def cb_ws_task_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -1756,6 +1764,33 @@ async def cb_admp_checkall(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         else:
             await ctx.bot.send_message(q.message.chat_id, chunk, reply_markup=markup)
 
+# ── Admin: WA task debug ─────────────────────────────
+async def cmd_wsdebug(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/wsdebug — last WA task ka raw ad_copy (hidden chars, \\r\\n, spaces) dikhata hai"""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    t = await ws_tasks_col.find_one({}, sort=[("created_at", -1)])
+    if not t:
+        await update.message.reply_text("Koi WA task DB me nahi hai."); return
+    raw = t.get("ad_copy", "") or ""
+    odd_map = {"\r": "CR", "\t": "TAB", "\u00a0": "NBSP", "\u200b": "ZWSP",
+               "\u200c": "ZWNJ", "\u200d": "ZWJ", "\u2028": "LS",
+               "\u2029": "PS", "\ufeff": "BOM"}
+    odd = {name: raw.count(ch) for ch, name in odd_map.items() if ch in raw}
+    text = (
+        f"🔧 WA DEBUG (last task)\n"
+        f"Status: {t.get('status')}\n"
+        f"Target: {t.get('target_phone')}\n"
+        f"Length: {len(raw)}\n"
+        f"LF count: {raw.count(chr(10))}\n"
+        f"Double spaces: {raw.count('  ')}\n"
+        f"Starts: {raw[:3]!r} | Ends: {raw[-3:]!r}\n"
+        f"Hidden chars: {odd or 'none'}\n"
+        f"WA_LINK_LF: {WA_LINK_LF}\n\n"
+        f"RAW:\n{raw!r}"
+    )
+    await update.message.reply_text(text[:3900])
+
 # ── Admin: Withdrawal management ─────────────────────
 def kb_wd_actions(wid):
     return InlineKeyboardMarkup([[
@@ -1905,6 +1940,7 @@ async def run_bot():
     # ── Core handlers ──────────────────────────────────
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("admin", cmd_admin))
+    app.add_handler(CommandHandler("wsdebug", cmd_wsdebug))
     app.add_handler(CallbackQueryHandler(cb_admp_checkall, pattern="^admp_checkall$"))
     app.add_handler(CallbackQueryHandler(cb_admp_wd, pattern="^admp_wd$"))
     app.add_handler(CallbackQueryHandler(cb_wd_action, pattern="^wd_(ok|no)_"))
