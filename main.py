@@ -52,7 +52,7 @@ COOKIE_FILE  = os.getenv("COOKIE_FILE", "cookies.txt")
 
 TASK_REWARD     = 0.25       # Telegram task reward (INR)
 WS_TASK_REWARD  = 0.25       # WhatsApp task reward (INR) — adjust karein
-WA_LINK_LF      = os.getenv("WA_LINK_LF", "0") == "1"   # 1 = link me \r\n ko \n bana do
+WA_LINK_LF      = os.getenv("WA_LINK_LF", "1") == "1"   # 1 = link me \r\n ko \n bana do (default ON)
 MIN_WITHDRAW    = 5          # minimum withdrawal (INR)
 WITHDRAW_TAX    = 2          # har withdrawal pe tax (INR)
 TASK_TIMEOUT    = 540        # seconds (9 min)
@@ -662,6 +662,8 @@ async def start_ws_task(uid, acc, msg):
 
         binding = status_data.get("data", {}).get("binding", {})
         reward_points_at_claim = binding.get("reward_points", 0)
+        _, me_data = await loop.run_in_executor(None, site, "GET", "/api/me", None, idx)
+        bal_at_claim = me_data.get("data", {}).get("points_balance", 0)
 
         logger.info(f"[WS TASK] uid={uid} cookie={idx} account_id={site_account_id} "
                     f"reward_points_at_claim={reward_points_at_claim} phase={phase}")
@@ -687,6 +689,7 @@ async def start_ws_task(uid, acc, msg):
             "reward_min_points": task_data.get("reward_min_points", 100),
             "reward_max_points": task_data.get("reward_max_points", 150),
             "reward_points_at_claim": reward_points_at_claim,
+            "bal_at_claim": bal_at_claim,
             "status": "pending",
             "created_at": datetime.now(),
             "expires_at": expires_at,
@@ -782,7 +785,7 @@ async def cb_ws_task_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("⏰ *Task expire ho gaya!*\n\nNaya WA task lo.", parse_mode="Markdown")
         return
 
-    await q.edit_message_text("⏳ Checking... (5 sec)")
+    await q.edit_message_text("⏳ Checking... (kuch seconds lagenge, wait karo)")
     loop = asyncio.get_event_loop()
     site_account_id = task.get("site_account_id")
     task_site_id = task.get("task_id")
@@ -792,56 +795,41 @@ async def cb_ws_task_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "account_id": site_account_id,
         "task_id": task_site_id,
     }
-    chk_code, chk_resp = await loop.run_in_executor(
-        None, site, "POST", "/api/tasks/check", check_body, idx)
-    logger.info(f"[WS CHECK-CALL] uid={uid} http={chk_code} resp={chk_resp}")
-
-    await asyncio.sleep(10)
-
     verified = False
     points_earned = 0
+    debug_log = []
+    MAX_ROUNDS = 4
+    bal_at_claim = task.get("bal_at_claim")
 
-    # Method 0: 404 = no active task = task already completed on site
-    if chk_code == 404:
-        logger.info(f"[WS CHECK-M0] 404 = task completed on site")
-        verified = True
-        points_earned = task.get("reward_min_points", 100)
+    # NOTE: /api/tasks/check WA ke liye "invalid task channel" (400) deta hai,
+    # isliye wo call hata di. Site WA message khud detect karti hai;
+    # hum /api/me points_balance (TG jaisa) aur current task status dekhte hain.
+    for rnd in range(1, MAX_ROUNDS + 1):
+        await asyncio.sleep(6)
 
-    # Method 1: matched=True in check response
-    if not verified:
-        chk_data = chk_resp.get("data", {}) if isinstance(chk_resp.get("data"), dict) else {}
-        chk_matched = chk_data.get("matched", False)
-        inner_task = chk_data.get("task", {}) or {}
-        inner_status = inner_task.get("status", "")
-        logger.info(f"[WS CHECK-M1] matched={chk_matched} status={inner_status}")
-        if chk_matched or inner_status == "completed":
+        # Method 1: points_balance badha? (TG jaisa)
+        _, me_now = await loop.run_in_executor(None, site, "GET", "/api/me", None, idx)
+        bal_now = me_now.get("data", {}).get("points_balance", 0)
+        logger.info(f"[WS CHECK-BAL] uid={uid} round={rnd} bal_at_claim={bal_at_claim} bal_now={bal_now}")
+        debug_log.append(f"R{rnd} bal_at_claim={bal_at_claim} bal_now={bal_now}")
+        if bal_at_claim is not None and bal_now > bal_at_claim:
             verified = True
-            points_earned = inner_task.get("total_reward_points", 0) or inner_task.get("reward_points", 0)
+            points_earned = bal_now - bal_at_claim
+            break
 
-    # Method 2: /api/tasks/current → status
-    if not verified:
+        # Method 2: /api/tasks/current me status completed?
         _, task_status = await loop.run_in_executor(
             None, site, "GET",
             f"/api/tasks/current?channel=whatsapp&account_id={site_account_id}", None, idx)
         current_task = task_status.get("data") or {}
-        if isinstance(current_task, dict):
-            current_status = current_task.get("status", "")
-            logger.info(f"[WS CHECK-M2] status={current_status}")
-            if current_status == "completed":
-                verified = True
-                points_earned = current_task.get("total_reward_points", 0) or current_task.get("reward_points", 0)
-
-    # Method 3: reward_points compare
-    if not verified:
-        _, status_data = await loop.run_in_executor(
-            None, site, "GET", f"/api/ws/status?account_id={site_account_id}", None, idx)
-        binding = status_data.get("data", {}).get("binding", {})
-        reward_now = binding.get("reward_points", 0)
-        reward_at_claim = task.get("reward_points_at_claim", 0)
-        logger.info(f"[WS CHECK-M3] reward_at_claim={reward_at_claim} reward_now={reward_now}")
-        if reward_now > reward_at_claim:
+        current_status = current_task.get("status", "") if isinstance(current_task, dict) else ""
+        logger.info(f"[WS CHECK-CUR] round={rnd} status={current_status} resp={task_status}")
+        debug_log.append(f"R{rnd} current status={current_status!r} resp={str(task_status)[:300]}")
+        if current_status in ("completed", "done", "success", "verified"):
             verified = True
-            points_earned = reward_now - reward_at_claim
+            points_earned = (current_task.get("total_reward_points", 0)
+                             or current_task.get("reward_points", 0))
+            break
 
     if verified:
         new_expires = datetime.now() + timedelta(seconds=WS_TASK_TIMEOUT)
@@ -862,6 +850,13 @@ async def cb_ws_task_done(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"📊 Total Balance: ₹{u['balance']:.2f}",
             parse_mode="Markdown")
     else:
+        try:
+            await ctx.bot.send_message(
+                ADMIN_ID,
+                f"🔧 WA VERIFY FAIL\nUser: {uid}\nTask: {task_site_id}\n"
+                f"Account: {site_account_id}\n\n" + "\n".join(debug_log)[:3400])
+        except Exception:
+            pass
         await q.edit_message_text(
             "❌ *Verify nahi hua*\n\n"
             "• WhatsApp pe message bheja?\n"
